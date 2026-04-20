@@ -21,6 +21,11 @@ class UserSession:
     awaiting_repo_name: bool = False
     awaiting_repo_visibility: bool = False
     auth_in_progress: bool = False
+    project_chat_mode: bool = False
+    project_context: str = ""
+    chat_history: list[dict[str, str]] = field(default_factory=list)
+    active_project_path: str = ""
+    active_github_url: str = ""
 
 
 class SessionStore:

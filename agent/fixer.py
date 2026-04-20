@@ -19,6 +19,11 @@ class BuildFixer:
     ) -> str:
         prompt = (
             "Fix the file so validation passes. Return only the full corrected file content, no markdown.\n\n"
+            "Language boundary rules:\n"
+            "- Keep each file language-pure.\n"
+            "- .html files must not contain inline CSS (<style>) or inline JavaScript (<script>...</script>).\n"
+            "- Put CSS in .css files and JS/TS in .js/.ts files referenced by HTML.\n"
+            "- .css files contain only CSS; .js/.ts files contain only script code.\n\n"
             f"Project context:\n{project_context}\n\n"
             f"File path: {file_path}\n"
             f"Current file content:\n{current_content}\n\n"

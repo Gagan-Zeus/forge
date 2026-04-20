@@ -320,6 +320,79 @@ class BuildOrchestrator:
             f"Details:\n{latest_error[:2500]}"
         )
 
+    async def attempt_single_fix(
+        self,
+        session: UserSession,
+        project_dir: Path,
+        candidate_files: list[str],
+        validation_command: str,
+        initial_error: str,
+        progress_callback: ProgressCallback,
+    ) -> str | None:
+        if self._is_non_fixable_runtime_validation_error(initial_error):
+            return (
+                "Validation failed with a runtime environment issue that cannot be auto-fixed in code. "
+                f"Issue: {self._summarize_issue(initial_error)}\n"
+                f"Details:\n{initial_error[:2500]}"
+            )
+
+        fixable_files = [path for path in candidate_files if path]
+        if not fixable_files:
+            return (
+                "Validation failed and no fixable source files were selected for a follow-up fix attempt. "
+                f"Issue: {self._summarize_issue(initial_error)}\n"
+                f"Details:\n{initial_error[:2500]}"
+            )
+
+        attempts = {path: 0 for path in fixable_files}
+        context = self._render_project_context(session, fixable_files)
+
+        await progress_callback(f"Validation issue: {self._summarize_issue(initial_error)}")
+
+        target = self._pick_target_file(initial_error, fixable_files, attempts)
+        if not target:
+            return (
+                "Validation failed and no clear target file could be inferred for a single follow-up fix attempt. "
+                f"Issue: {self._summarize_issue(initial_error)}\n"
+                f"Details:\n{initial_error[:2500]}"
+            )
+
+        attempts[target] += 1
+        await progress_callback(
+            "Found an issue, fixing... "
+            f"target={target} "
+            "(attempt 1/1, total 1/1)"
+        )
+        current_content = await self._file_writer.read_file(project_dir, target)
+        fixed_content = await self._fixer.fix_file(
+            file_path=target,
+            current_content=current_content,
+            error_output=initial_error,
+            project_context=context,
+            model=session.model,
+        )
+
+        if fixed_content == current_content:
+            return (
+                "Validation is still failing and the single fix attempt produced no code change. "
+                f"Issue: {self._summarize_issue(initial_error)}\n"
+                f"Details:\n{initial_error[:2500]}"
+            )
+
+        await self._file_writer.write_file(project_dir, target, fixed_content)
+
+        validation_result = await self._shell_runner.run(validation_command, project_dir)
+        if validation_result["success"]:
+            return None
+
+        latest_error = self._combine_output(validation_result)
+        await progress_callback(f"Issue after fix: {self._summarize_issue(latest_error)}")
+        return (
+            "Validation failed after single fix attempt. "
+            f"Issue: {self._summarize_issue(latest_error)}\n"
+            f"Details:\n{latest_error[:2500]}"
+        )
+
     async def _generate_file_content(
         self,
         session: UserSession,
@@ -332,6 +405,11 @@ class BuildOrchestrator:
             "Generate the full file content for the requested file.\n"
             "Return only file content without markdown fences.\n"
             "Keep production-quality style with clear error handling and type hints when relevant.\n\n"
+            "Language boundary rules:\n"
+            "- Keep each file language-pure.\n"
+            "- .html files must not contain inline CSS (<style>) or inline JavaScript (<script>...</script>).\n"
+            "- Put CSS in .css files and JS/TS in .js/.ts files, then reference them from HTML.\n"
+            "- .css files contain only CSS; .js/.ts files contain only script code.\n\n"
             f"Project idea: {session.idea}\n"
             f"Stack: {session.stack}\n"
             f"Requirements: {session.requirements or 'none'}\n"
@@ -339,6 +417,27 @@ class BuildOrchestrator:
             f"Target file: {file_path}\n"
             f"Target purpose: {file_description}\n"
         )
+        lowered_file_path = file_path.lower()
+        if lowered_file_path.endswith(".html"):
+            prompt += (
+                "\nHTML strictness:\n"
+                "- Use markup structure only.\n"
+                "- No <style> blocks.\n"
+                "- No inline <script> blocks.\n"
+                "- Use <link rel=\"stylesheet\" ...> and <script src=\"...\"></script> references only.\n"
+            )
+        elif lowered_file_path.endswith((".js", ".jsx", ".ts", ".tsx")):
+            prompt += (
+                "\nScript strictness:\n"
+                "- Return only script code for this file type.\n"
+                "- Do not emit HTML/CSS markup in this file.\n"
+            )
+        elif lowered_file_path.endswith((".css", ".scss", ".sass")):
+            prompt += (
+                "\nStyle strictness:\n"
+                "- Return only style rules for this file type.\n"
+                "- Do not emit HTML or JavaScript in this file.\n"
+            )
         if file_path.lower() == "readme.md":
             prompt += (
                 "\nREADME requirements:\n"
@@ -685,6 +784,20 @@ class BuildOrchestrator:
             "blocked unsafe command by policy" in lowered
             or "blocked command outside allowed directory" in lowered
         )
+
+    @staticmethod
+    def _is_non_fixable_runtime_validation_error(error_text: str) -> bool:
+        lowered = error_text.lower()
+        signals = (
+            "address already in use",
+            "port 5000 is in use",
+            "eaddrinuse",
+            "permission denied",
+            "operation not permitted",
+            "connection refused",
+            "network is unreachable",
+        )
+        return any(signal in lowered for signal in signals)
 
     @classmethod
     def _fallback_readme(cls, session: UserSession, created_files: list[str]) -> str:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -17,6 +18,8 @@ LOGGER = logging.getLogger(__name__)
 class RepositoryInfo:
     full_name: str
     html_url: str
+    author_name: str
+    author_email: str
 
 
 class GitHubPusher:
@@ -36,11 +39,11 @@ class GitHubPusher:
         remote_url = f"https://x-access-token:{access_token}@github.com/{repo.full_name}.git"
 
         await self._run_or_raise("git init", project_path, access_token)
-        await self._run_or_raise('git config user.name "telegram-builder"', project_path, access_token)
-        await self._run_or_raise('git config user.email "telegram-builder@local"', project_path, access_token)
+        await self._run_or_raise(f'git config user.name "{self._shell_quote_double(repo.author_name)}"', project_path, access_token)
+        await self._run_or_raise(f'git config user.email "{self._shell_quote_double(repo.author_email)}"', project_path, access_token)
         await self._run_or_raise("git add .", project_path, access_token)
 
-        commit_result = await self._shell_runner.run('git commit -m "Initial commit from telegram-builder"', project_path)
+        commit_result = await self._shell_runner.run('git commit -m "Automated project update"', project_path)
         combined_commit_output = (commit_result["output"] + "\n" + commit_result["error"]).lower()
         if not commit_result["success"] and "nothing to commit" not in combined_commit_output:
             self._raise_git_error("git commit", commit_result, access_token)
@@ -53,13 +56,19 @@ class GitHubPusher:
 
     def _create_or_get_repo(self, access_token: str, repo_name: str, visibility: str) -> RepositoryInfo:
         client = Github(access_token)
+        author_name, author_email = self._resolve_author_identity(client)
         owner_login, owner = self._resolve_owner(client)
         private = visibility.lower() != "public"
         full_name = f"{owner_login}/{repo_name}"
 
         try:
             repository = client.get_repo(full_name)
-            return RepositoryInfo(full_name=repository.full_name, html_url=repository.html_url)
+            return RepositoryInfo(
+                full_name=repository.full_name,
+                html_url=repository.html_url,
+                author_name=author_name,
+                author_email=author_email,
+            )
         except GithubException as exc:
             if getattr(exc, "status", None) != 404:
                 raise RuntimeError(
@@ -82,12 +91,25 @@ class GitHubPusher:
                 "Ensure the authenticated account has permission to create repositories and write access to the target owner. "
                 f"Details: {details}"
             ) from exc
-        return RepositoryInfo(full_name=repository.full_name, html_url=repository.html_url)
+        return RepositoryInfo(
+            full_name=repository.full_name,
+            html_url=repository.html_url,
+            author_name=author_name,
+            author_email=author_email,
+        )
+
+    @staticmethod
+    def _resolve_author_identity(client: Github) -> tuple[str, str]:
+        user = client.get_user()
+        login = str(getattr(user, "login", "")).strip() or "github-user"
+        name = str(getattr(user, "name", "")).strip() or login
+        email = str(getattr(user, "email", "")).strip() or f"{login}@users.noreply.github.com"
+        return name, email
 
     def _resolve_owner(self, client: Github):
         authenticated_user = client.get_user()
         authenticated_login = str(getattr(authenticated_user, "login", "")).strip()
-        requested_owner = self._github_username.strip()
+        requested_owner = self._normalize_owner_name(self._github_username)
 
         if not requested_owner:
             return authenticated_login, authenticated_user
@@ -106,13 +128,28 @@ class GitHubPusher:
 
         # If requested owner is not an organization and doesn't match the authenticated user,
         # push to the authenticated user's namespace to avoid hard failure on 404.
-        LOGGER.warning(
+        LOGGER.info(
             "GITHUB_USERNAME='%s' does not match authenticated user '%s' and is not an accessible organization. "
             "Falling back to authenticated user.",
             requested_owner,
             authenticated_login,
         )
         return authenticated_login, authenticated_user
+
+    @staticmethod
+    def _normalize_owner_name(owner: str) -> str:
+        requested = owner.strip()
+        if not requested:
+            return ""
+
+        # GitHub owner names cannot contain spaces and are URL-safe slugs.
+        if not re.fullmatch(r"[A-Za-z0-9-]+", requested):
+            return ""
+
+        if requested.startswith("-") or requested.endswith("-"):
+            return ""
+
+        return requested
 
     async def _run_or_raise(self, command: str, cwd: Path, token: str) -> None:
         result = await self._shell_runner.run(command, cwd)
@@ -145,3 +182,7 @@ class GitHubPusher:
         if not token:
             return text
         return text.replace(token, "***")
+
+    @staticmethod
+    def _shell_quote_double(text: str) -> str:
+        return text.replace("\\", "\\\\").replace('"', '\\"')
