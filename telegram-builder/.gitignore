@@ -1,0 +1,6 @@
+.env
+auth/tokens.json
+generated_projects/
+__pycache__/
+*.pyc
+.venv/

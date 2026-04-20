@@ -1,0 +1,5 @@
+python-telegram-bot==22.7
+httpx==0.28.1
+PyGitHub==2.4.0
+python-dotenv==1.0.1
+aiofiles==24.1.0
