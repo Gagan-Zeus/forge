@@ -36,6 +36,9 @@ class BuildCancelledError(RuntimeError):
 
 
 class BuildOrchestrator:
+    MAX_FIX_ATTEMPTS_PER_FILE = 3
+    MAX_TOTAL_FIX_ATTEMPTS = 8
+
     def __init__(
         self,
         copilot_client: CopilotClient,
@@ -92,7 +95,16 @@ class BuildOrchestrator:
                 created_files.append(relative_path)
                 await progress_callback(f"Writing {relative_path}... ({index}/{len(plan)})")
 
-            install_command = self._pick_install_command(session.stack, created_files)
+            readme_content = self._load_readme_content(project_dir)
+            if not readme_content:
+                await progress_callback("README.md missing or empty. Generating required README...")
+                fallback_readme = self._fallback_readme(session, created_files)
+                await self._file_writer.write_file(project_dir, "README.md", fallback_readme)
+                if "README.md" not in created_files:
+                    created_files.append("README.md")
+                readme_content = fallback_readme
+
+            install_command = self._pick_install_command(session.stack, created_files, readme_content)
             if install_command:
                 await self._raise_if_cancelled(cancel_event)
                 await progress_callback("Installing dependencies...")
@@ -100,11 +112,45 @@ class BuildOrchestrator:
                 if not install_result["success"]:
                     warnings.append(self._format_command_warning("dependency install", install_result))
 
-            validation_command = self._pick_validation_command(session.stack, created_files)
+            validation_command, validation_from_readme = self._pick_validation_command(
+                session.stack,
+                created_files,
+                readme_content,
+            )
             if validation_command:
                 await self._raise_if_cancelled(cancel_event)
-                await progress_callback("Running validation...")
+                if validation_from_readme:
+                    command_label = (
+                        validation_command
+                        if len(validation_command) <= 180
+                        else validation_command[:180] + "..."
+                    )
+                    await progress_callback(f"Running validation from README command: {command_label}")
+                else:
+                    await progress_callback("Running validation...")
                 validation_result = await self._shell_runner.run(validation_command, project_dir)
+                if not validation_result["success"] and validation_from_readme:
+                    validation_error_text = self._combine_output(validation_result)
+                    if self._is_policy_block_error(validation_error_text):
+                        fallback_validation_command, _ = self._pick_validation_command(
+                            session.stack,
+                            created_files,
+                            None,
+                        )
+                        if fallback_validation_command and fallback_validation_command != validation_command:
+                            fallback_label = (
+                                fallback_validation_command
+                                if len(fallback_validation_command) <= 180
+                                else fallback_validation_command[:180] + "..."
+                            )
+                            await progress_callback(
+                                "README validation command was blocked by safety policy. "
+                                "Falling back to inferred validation command."
+                            )
+                            await progress_callback(f"Running fallback validation command: {fallback_label}")
+                            validation_command = fallback_validation_command
+                            validation_result = await self._shell_runner.run(validation_command, project_dir)
+
                 if not validation_result["success"]:
                     fix_error = await self._attempt_fixes(
                         session=session,
@@ -182,17 +228,32 @@ class BuildOrchestrator:
         attempts = {path: 0 for path in created_files}
         latest_error = initial_error
         context = self._render_project_context(session, created_files)
+        total_attempts = 0
+        repeated_error_streak = 0
+        no_change_streak = 0
+        previous_error_fingerprint = self._error_fingerprint(latest_error)
 
-        while True:
+        await progress_callback(f"Validation issue: {self._summarize_issue(latest_error)}")
+
+        while total_attempts < self.MAX_TOTAL_FIX_ATTEMPTS:
             target = self._pick_target_file(latest_error, created_files, attempts)
             if not target:
                 return (
-                    "Validation failed and no further fixes are possible. "
-                    f"Last error:\n{latest_error[:2500]}"
+                    "Validation failed and no clear target file could be inferred from test output. "
+                    f"Issue: {self._summarize_issue(latest_error)}\n"
+                    f"Details:\n{latest_error[:2500]}"
                 )
 
-            await progress_callback("Found an issue, fixing...")
             attempts[target] += 1
+            total_attempts += 1
+            await progress_callback(
+                (
+                    "Found an issue, fixing... "
+                    f"target={target} "
+                    f"(attempt {attempts[target]}/{self.MAX_FIX_ATTEMPTS_PER_FILE}, "
+                    f"total {total_attempts}/{self.MAX_TOTAL_FIX_ATTEMPTS})"
+                )
+            )
             current_content = await self._file_writer.read_file(project_dir, target)
             fixed_content = await self._fixer.fix_file(
                 file_path=target,
@@ -201,6 +262,28 @@ class BuildOrchestrator:
                 project_context=context,
                 model=session.model,
             )
+
+            if fixed_content == current_content:
+                no_change_streak += 1
+                await progress_callback(
+                    f"Fix attempt produced no code change for {target}; trying another strategy..."
+                )
+                if no_change_streak >= 3:
+                    return (
+                        "Validation is still failing and fixes are not changing the code. "
+                        f"Issue: {self._summarize_issue(latest_error)}\n"
+                        f"Details:\n{latest_error[:2500]}"
+                    )
+
+                if all(count >= self.MAX_FIX_ATTEMPTS_PER_FILE for count in attempts.values()):
+                    return (
+                        "Validation failed after max retries (3 attempts per file). "
+                        f"Issue: {self._summarize_issue(latest_error)}\n"
+                        f"Details:\n{latest_error[:2500]}"
+                    )
+                continue
+
+            no_change_streak = 0
             await self._file_writer.write_file(project_dir, target, fixed_content)
 
             validation_result = await self._shell_runner.run(validation_command, project_dir)
@@ -208,11 +291,34 @@ class BuildOrchestrator:
                 return None
 
             latest_error = self._combine_output(validation_result)
-            if all(count >= 3 for count in attempts.values()):
+            await progress_callback(f"Issue after fix: {self._summarize_issue(latest_error)}")
+
+            current_error_fingerprint = self._error_fingerprint(latest_error)
+            if current_error_fingerprint == previous_error_fingerprint:
+                repeated_error_streak += 1
+            else:
+                repeated_error_streak = 0
+            previous_error_fingerprint = current_error_fingerprint
+
+            if repeated_error_streak >= 2:
+                return (
+                    "Validation is still failing with the same repeated issue after multiple fix attempts. "
+                    f"Issue: {self._summarize_issue(latest_error)}\n"
+                    f"Details:\n{latest_error[:2500]}"
+                )
+
+            if all(count >= self.MAX_FIX_ATTEMPTS_PER_FILE for count in attempts.values()):
                 return (
                     "Validation failed after max retries (3 attempts per file). "
-                    f"Last error:\n{latest_error[:2500]}"
+                    f"Issue: {self._summarize_issue(latest_error)}\n"
+                    f"Details:\n{latest_error[:2500]}"
                 )
+
+        return (
+            "Validation failed after maximum total fix attempts. "
+            f"Issue: {self._summarize_issue(latest_error)}\n"
+            f"Details:\n{latest_error[:2500]}"
+        )
 
     async def _generate_file_content(
         self,
@@ -233,6 +339,15 @@ class BuildOrchestrator:
             f"Target file: {file_path}\n"
             f"Target purpose: {file_description}\n"
         )
+        if file_path.lower() == "readme.md":
+            prompt += (
+                "\nREADME requirements:\n"
+                "- Include sections: Overview, Setup, Run, Testing.\n"
+                "- Include command examples in fenced bash blocks.\n"
+                "- Testing section must contain non-interactive validation commands that can be run in CI.\n"
+                "- Commands must exactly match this project's actual scripts/files.\n"
+                "- Avoid curl, wget, sudo, eval, or destructive commands in any command examples.\n"
+            )
         response = await self._copilot_client.call(
             messages=[{"role": "user", "content": prompt}],
             model=session.model,
@@ -255,8 +370,17 @@ class BuildOrchestrator:
         words = [word for word in re.split(r"\W+", session.idea.lower()) if word]
         return "-".join(words[:4]) or "generated-project"
 
-    @staticmethod
-    def _pick_install_command(stack: str, created_files: list[str]) -> str | None:
+    @classmethod
+    def _pick_install_command(
+        cls,
+        stack: str,
+        created_files: list[str],
+        readme_content: str | None = None,
+    ) -> str | None:
+        readme_install = cls._pick_install_command_from_readme(readme_content)
+        if readme_install:
+            return readme_install
+
         lowered_stack = stack.lower()
         has_package_json = any(Path(path).name == "package.json" for path in created_files)
         has_requirements = any(Path(path).name == "requirements.txt" for path in created_files)
@@ -270,24 +394,260 @@ class BuildOrchestrator:
             return "python -m pip install -e ."
         return None
 
-    @staticmethod
-    def _pick_validation_command(stack: str, created_files: list[str]) -> str | None:
+    @classmethod
+    def _pick_validation_command(
+        cls,
+        stack: str,
+        created_files: list[str],
+        readme_content: str | None = None,
+    ) -> tuple[str | None, bool]:
+        readme_validation = cls._pick_validation_command_from_readme(readme_content)
+        if readme_validation:
+            return readme_validation, True
+
         lowered_stack = stack.lower()
         file_set = set(created_files)
         has_python_files = any(path.endswith(".py") for path in created_files)
         has_package_json = any(Path(path).name == "package.json" for path in created_files)
 
         if any(keyword in lowered_stack for keyword in ("node", "react", "next", "javascript", "typescript")) or has_package_json:
-            return "npm run test --if-present && npm run build --if-present"
+            return "npm run test --if-present && npm run build --if-present", False
 
         if has_python_files:
             if any(path.startswith("tests/") for path in created_files):
-                return "python -m pytest -q"
+                return "python -m pytest -q", False
+            for candidate in ("main.py", "app.py", "src/main.py", "src/app.py"):
+                if candidate in file_set:
+                    return f"python {candidate}", False
+            return "python -m compileall -q .", False
+        return None, False
+
+    @classmethod
+    def _pick_install_command_from_readme(cls, readme_content: str | None) -> str | None:
+        if not readme_content:
+            return None
+        for command in cls._extract_shell_commands_from_readme(readme_content):
+            if cls._is_install_command(command) and cls._is_safe_for_runner(command):
+                return command
+        return None
+
+    @classmethod
+    def _pick_validation_command_from_readme(cls, readme_content: str | None) -> str | None:
+        if not readme_content:
+            return None
+
+        selected: list[str] = []
+        for command in cls._extract_shell_commands_from_readme(readme_content):
+            if not cls._looks_like_shell_command(command):
+                continue
+            if not cls._is_safe_for_runner(command):
+                continue
+            if cls._is_install_command(command) or cls._is_interactive_command(command):
+                continue
+            if cls._is_validation_command(command):
+                selected.append(command)
+
+        if not selected:
+            return None
+
+        # Keep execution bounded and deterministic.
+        return " && ".join(selected[:2])
+
+    @staticmethod
+    def _extract_shell_commands_from_readme(readme_content: str) -> list[str]:
+        fence_pattern = re.compile(
+            r"```(?:bash|sh|zsh|shell|cmd|powershell|pwsh)?\s*\n(.*?)```",
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        commands: list[str] = []
+
+        for block in fence_pattern.findall(readme_content):
+            for line in block.splitlines():
+                command = line.strip()
+                if not command or command.startswith("#"):
+                    continue
+                if command.startswith("$"):
+                    command = command[1:].strip()
+                if not command or command.startswith(("cd ", "export ", "set ")):
+                    continue
+                if not BuildOrchestrator._looks_like_shell_command(command):
+                    continue
+                if not BuildOrchestrator._is_safe_for_runner(command):
+                    continue
+                commands.append(command)
+
+        if not commands:
+            inline = re.findall(r"`([^`\n]+)`", readme_content)
+            for snippet in inline:
+                command = snippet.strip()
+                if BuildOrchestrator._looks_like_shell_command(command):
+                    commands.append(command)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for command in commands:
+            key = command.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(command)
+        return deduped
+
+    @staticmethod
+    def _looks_like_shell_command(command: str) -> bool:
+        lowered = command.lower()
+        return lowered.startswith(
+            (
+                "npm ",
+                "pnpm ",
+                "yarn ",
+                "bun ",
+                "python ",
+                "pytest",
+                "pip ",
+                "poetry ",
+                "uv ",
+                "go ",
+                "cargo ",
+                "dotnet ",
+                "mvn ",
+                "gradle ",
+                "make ",
+            )
+        )
+
+    @staticmethod
+    def _is_install_command(command: str) -> bool:
+        lowered = command.lower()
+        return lowered.startswith(
+            (
+                "npm install",
+                "npm ci",
+                "pnpm install",
+                "yarn install",
+                "bun install",
+                "python -m pip install",
+                "pip install",
+                "poetry install",
+                "uv pip install",
+                "pipenv install",
+            )
+        )
+
+    @staticmethod
+    def _is_interactive_command(command: str) -> bool:
+        lowered = command.lower()
+        interactive_prefixes = (
+            "npm run dev",
+            "pnpm dev",
+            "yarn dev",
+            "bun run dev",
+            "npm start",
+            "pnpm start",
+            "yarn start",
+            "vite",
+            "next dev",
+            "react-scripts start",
+            "flask run",
+            "python -m http.server",
+        )
+        if lowered.startswith(interactive_prefixes):
+            if lowered.startswith("vite build"):
+                return False
+            return True
+        return " --watch" in lowered or " watch" in lowered or "--reload" in lowered
+
+    @staticmethod
+    def _is_validation_command(command: str) -> bool:
+        lowered = command.lower()
+        validation_tokens = (
+            " test",
+            "pytest",
+            "vitest",
+            "jest",
+            "unittest",
+            " build",
+            " compile",
+            "compileall",
+            " lint",
+            " typecheck",
+        )
+        if any(token in lowered for token in validation_tokens):
+            return True
+        return lowered.startswith(("python ", "go test", "cargo test", "dotnet test", "mvn test", "gradle test"))
+
+    @staticmethod
+    def _is_safe_for_runner(command: str) -> bool:
+        blocked_patterns = (
+            r"rm\s+-rf\s+/",
+            r"\bsudo\b",
+            r"\bcurl\b",
+            r"\bwget\b",
+            r"\beval\b",
+        )
+        lowered = command.lower()
+        return not any(re.search(pattern, lowered) for pattern in blocked_patterns)
+
+    @staticmethod
+    def _is_policy_block_error(error_text: str) -> bool:
+        lowered = error_text.lower()
+        return (
+            "blocked unsafe command by policy" in lowered
+            or "blocked command outside allowed directory" in lowered
+        )
+
+    @classmethod
+    def _fallback_readme(cls, session: UserSession, created_files: list[str]) -> str:
+        install_command = cls._pick_install_command(session.stack, created_files, None)
+        validation_command, _ = cls._pick_validation_command(session.stack, created_files, None)
+        run_command = cls._pick_run_command(session.stack, created_files)
+
+        install_line = install_command or "# No dependency install command inferred"
+        validation_line = validation_command or "# No validation command inferred"
+
+        return (
+            f"# {cls._derive_project_name(session)}\n\n"
+            f"Generated project for: {session.idea}\n\n"
+            "## Setup\n\n"
+            "```bash\n"
+            f"{install_line}\n"
+            "```\n\n"
+            "## Run\n\n"
+            "```bash\n"
+            f"{run_command}\n"
+            "```\n\n"
+            "## Testing\n\n"
+            "```bash\n"
+            f"{validation_line}\n"
+            "```\n"
+        )
+
+    @staticmethod
+    def _pick_run_command(stack: str, created_files: list[str]) -> str:
+        lowered_stack = stack.lower()
+        file_set = set(created_files)
+        has_package_json = any(Path(path).name == "package.json" for path in created_files)
+        has_python_files = any(path.endswith(".py") for path in created_files)
+
+        if any(keyword in lowered_stack for keyword in ("node", "react", "next", "javascript", "typescript")) or has_package_json:
+            return "npm run dev"
+
+        if has_python_files:
             for candidate in ("main.py", "app.py", "src/main.py", "src/app.py"):
                 if candidate in file_set:
                     return f"python {candidate}"
-            return "python -m compileall -q ."
-        return None
+        return "# Add your run command here"
+
+    @staticmethod
+    def _load_readme_content(project_dir: Path) -> str | None:
+        readme_path = project_dir / "README.md"
+        if not readme_path.exists():
+            return None
+        try:
+            content = readme_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return content or None
 
     @staticmethod
     def _combine_output(command_result: dict[str, object]) -> str:
@@ -306,18 +666,18 @@ class BuildOrchestrator:
     def _pick_target_file(error_output: str, files: list[str], attempts: dict[str, int]) -> str | None:
         lowered_error = error_output.lower()
         for path in files:
-            if attempts[path] >= 3:
+            if attempts[path] >= BuildOrchestrator.MAX_FIX_ATTEMPTS_PER_FILE:
                 continue
             if path.lower() in lowered_error:
                 return path
 
         for path in files:
-            if attempts[path] >= 3:
+            if attempts[path] >= BuildOrchestrator.MAX_FIX_ATTEMPTS_PER_FILE:
                 continue
             if Path(path).name.lower() in lowered_error:
                 return path
 
-        available = [path for path in files if attempts[path] < 3]
+        available = [path for path in files if attempts[path] < BuildOrchestrator.MAX_FIX_ATTEMPTS_PER_FILE]
         if not available:
             return None
         return min(available, key=lambda item: attempts[item])
@@ -336,3 +696,25 @@ class BuildOrchestrator:
     async def _raise_if_cancelled(cancel_event: asyncio.Event) -> None:
         if cancel_event.is_set():
             raise BuildCancelledError
+
+    @staticmethod
+    def _summarize_issue(error_output: str, max_chars: int = 280) -> str:
+        lines = [line.strip() for line in error_output.splitlines() if line.strip()]
+        if not lines:
+            return "Unknown validation issue."
+
+        priority_tokens = ("error", "failed", "exception", "traceback", "npm err", "assert")
+        selected = lines[0]
+        for line in lines:
+            if any(token in line.lower() for token in priority_tokens):
+                selected = line
+                break
+
+        if len(selected) <= max_chars:
+            return selected
+        return selected[:max_chars] + "..."
+
+    @staticmethod
+    def _error_fingerprint(error_output: str) -> str:
+        normalized = " ".join(error_output.lower().split())
+        return normalized[:500]

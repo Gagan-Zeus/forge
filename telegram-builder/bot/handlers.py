@@ -457,10 +457,12 @@ async def _start_build(
                 live_session.current_step = 1
                 await _ask_step_1(application, chat_id, live_session)
             else:
+                issue = (result.error or "Unknown error").strip()
+                bounded_issue = issue if len(issue) <= 3500 else issue[:3500] + "..."
                 await _safe_send_message(
                     application,
                     chat_id,
-                    f"Build failed: {result.error or 'Unknown error'}",
+                    f"Build failed during validation/build.\nIssue:\n{bounded_issue}",
                 )
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("Build task crashed for chat_id=%s", chat_id)
