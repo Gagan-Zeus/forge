@@ -39,6 +39,8 @@ class CopilotClient:
     EDITOR_VERSION = "vscode/1.85.0"
     EDITOR_PLUGIN_VERSION = "copilot-chat/0.13.0"
     USER_AGENT = "GitHubCopilotChat/0.13.0"
+    CHAT_MAX_ATTEMPTS = 4
+    CHAT_RETRYABLE_STATUS_CODES = (408, 409, 425, 429, 500, 502, 503, 504)
 
     SUPPORTED_MODELS = (
         "gpt-5.2",
@@ -244,47 +246,101 @@ class CopilotClient:
             "Accept": "text/event-stream",
         }
 
-        output_chunks: list[str] = []
-        async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
-            async with client.stream("POST", self.CHAT_COMPLETIONS_URL, headers=headers, json=payload) as response:
-                if response.status_code >= 400:
-                    error_text = (await response.aread()).decode("utf-8", errors="replace")
-                    raise CopilotAPIError(
-                        f"Copilot API call failed ({response.status_code}): {error_text[:500]}"
+        for attempt in range(1, self.CHAT_MAX_ATTEMPTS + 1):
+            should_retry_status = False
+            retry_status_delay = 0.0
+            output_chunks: list[str] = []
+
+            try:
+                async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
+                    async with client.stream("POST", self.CHAT_COMPLETIONS_URL, headers=headers, json=payload) as response:
+                        if response.status_code >= 400:
+                            error_text = (await response.aread()).decode("utf-8", errors="replace")
+                            if (
+                                response.status_code in self.CHAT_RETRYABLE_STATUS_CODES
+                                and attempt < self.CHAT_MAX_ATTEMPTS
+                            ):
+                                retry_status_delay = self._retry_delay_seconds(attempt)
+                                should_retry_status = True
+                                LOGGER.warning(
+                                    "Copilot API transient HTTP %s on attempt %s/%s. Retrying in %.1fs.",
+                                    response.status_code,
+                                    attempt,
+                                    self.CHAT_MAX_ATTEMPTS,
+                                    retry_status_delay,
+                                )
+                            else:
+                                raise CopilotAPIError(
+                                    f"Copilot API call failed ({response.status_code}): {error_text[:500]}"
+                                )
+                        else:
+                            async for line in response.aiter_lines():
+                                if not line.startswith("data:"):
+                                    continue
+                                data = line[len("data:") :].strip()
+                                if not data or data == "[DONE]":
+                                    if data == "[DONE]":
+                                        break
+                                    continue
+                                try:
+                                    chunk = json.loads(data)
+                                except json.JSONDecodeError:
+                                    continue
+
+                                choices = chunk.get("choices") or []
+                                if not choices:
+                                    continue
+                                choice = choices[0]
+                                delta = choice.get("delta") or {}
+                                content = delta.get("content")
+                                if content:
+                                    output_chunks.append(str(content))
+                                    continue
+
+                                message = choice.get("message") or {}
+                                message_content = message.get("content")
+                                if message_content:
+                                    output_chunks.append(str(message_content))
+
+                if should_retry_status:
+                    await asyncio.sleep(retry_status_delay)
+                    continue
+
+                text = "".join(output_chunks).strip()
+                if text:
+                    return text
+
+                if attempt < self.CHAT_MAX_ATTEMPTS:
+                    empty_retry_delay = self._retry_delay_seconds(attempt)
+                    LOGGER.warning(
+                        "Copilot API returned an empty response on attempt %s/%s. Retrying in %.1fs.",
+                        attempt,
+                        self.CHAT_MAX_ATTEMPTS,
+                        empty_retry_delay,
                     )
+                    await asyncio.sleep(empty_retry_delay)
+                    continue
 
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[len("data:") :].strip()
-                    if not data or data == "[DONE]":
-                        if data == "[DONE]":
-                            break
-                        continue
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
+                raise CopilotAPIError("Copilot API returned an empty response.")
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.NetworkError) as exc:
+                if attempt >= self.CHAT_MAX_ATTEMPTS:
+                    raise CopilotAPIError(
+                        "Could not reach the Copilot API after multiple attempts. "
+                        "Check your internet connection and DNS, then retry the build. "
+                        f"Last error: {exc}"
+                    ) from exc
 
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    choice = choices[0]
-                    delta = choice.get("delta") or {}
-                    content = delta.get("content")
-                    if content:
-                        output_chunks.append(str(content))
-                        continue
+                retry_delay = self._retry_delay_seconds(attempt)
+                LOGGER.warning(
+                    "Copilot API network error on attempt %s/%s: %s. Retrying in %.1fs.",
+                    attempt,
+                    self.CHAT_MAX_ATTEMPTS,
+                    exc,
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
 
-                    message = choice.get("message") or {}
-                    message_content = message.get("content")
-                    if message_content:
-                        output_chunks.append(str(message_content))
-
-        text = "".join(output_chunks).strip()
-        if not text:
-            raise CopilotAPIError("Copilot API returned an empty response.")
-        return text
+        raise CopilotAPIError("Copilot API call failed after retries.")
 
     @classmethod
     def available_models(cls) -> tuple[str, ...]:
@@ -338,3 +394,8 @@ class CopilotClient:
             return str(payload)[:300]
         except ValueError:
             return response.text.strip()[:300] or "No response body"
+
+    @staticmethod
+    def _retry_delay_seconds(attempt: int) -> float:
+        # Exponential backoff capped to keep the overall build responsive.
+        return min(1.5 * (2 ** (attempt - 1)), 10.0)

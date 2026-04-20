@@ -14,7 +14,7 @@
 1. Clone the repository and enter it:
    ```bash
    git clone <your-repo-url>
-   cd telegram-builder
+   cd forge
    ```
 2. Create and activate a virtual environment (recommended):
    ```bash
@@ -32,6 +32,7 @@
    Fill in:
    - `TELEGRAM_BOT_TOKEN`
    - `GITHUB_USERNAME`
+   - `GITHUB_TOKEN` (recommended for GitHub push; PAT with repo permissions)
    - `PROJECTS_DIR` (default: `./generated_projects`)
 
 ## How To Run
@@ -112,6 +113,7 @@ Model support is centralized in `models/copilot_client.py`:
 
 ### GitHub push failed
 
-- Confirm your authenticated GitHub token has repository permissions.
+- Set `GITHUB_TOKEN` in `.env` to a PAT with repository create/push permissions.
+- Confirm the token owner can create repos under `GITHUB_USERNAME` (user or org).
 - Ensure local Git is installed and configured.
 - Try with `Push to GitHub = no` to validate local generation first.

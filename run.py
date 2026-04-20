@@ -12,5 +12,6 @@ if __name__ == "__main__":
     run_bot(
         telegram_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         github_username=os.getenv("GITHUB_USERNAME", ""),
+        github_token=os.getenv("GITHUB_TOKEN", ""),
         projects_dir=os.getenv("PROJECTS_DIR", "./generated_projects"),
     )

@@ -64,7 +64,7 @@ class RuntimeServices:
     orchestrator: BuildOrchestrator
 
 
-def run_bot(telegram_token: str, github_username: str, projects_dir: str) -> None:
+def run_bot(telegram_token: str, github_username: str, github_token: str, projects_dir: str) -> None:
     if not telegram_token:
         raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment.")
 
@@ -74,9 +74,16 @@ def run_bot(telegram_token: str, github_username: str, projects_dir: str) -> Non
     copilot_client = CopilotClient(tokens_path=Path("auth") / "tokens.json")
     planner = ProjectPlanner(copilot_client)
     fixer = BuildFixer(copilot_client)
+    github_pat = github_token.strip()
+
+    async def github_access_token_provider() -> str:
+        if github_pat:
+            return github_pat
+        return await copilot_client.get_access_token()
+
     github_pusher = GitHubPusher(
         github_username=github_username,
-        access_token_provider=copilot_client.get_access_token,
+        access_token_provider=github_access_token_provider,
         shell_runner=shell_runner,
     )
     orchestrator = BuildOrchestrator(
