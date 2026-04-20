@@ -110,6 +110,7 @@ Model support is centralized in `models/copilot_client.py`:
 - Use `/status` to inspect progress.
 - Review the error summary sent by the bot.
 - If generated code still fails after retries, refine requirements and restart with `/reset`.
+- Some models are not served on `/chat/completions`; the client now auto-falls back to `/responses` when required.
 
 ### GitHub push failed
 

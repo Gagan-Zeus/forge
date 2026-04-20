@@ -36,6 +36,7 @@ class CopilotClient:
     ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
     COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token"
     CHAT_COMPLETIONS_URL = "https://api.githubcopilot.com/chat/completions"
+    RESPONSES_URL = "https://api.githubcopilot.com/responses"
     EDITOR_VERSION = "vscode/1.85.0"
     EDITOR_PLUGIN_VERSION = "copilot-chat/0.13.0"
     USER_AGENT = "GitHubCopilotChat/0.13.0"
@@ -256,6 +257,13 @@ class CopilotClient:
                     async with client.stream("POST", self.CHAT_COMPLETIONS_URL, headers=headers, json=payload) as response:
                         if response.status_code >= 400:
                             error_text = (await response.aread()).decode("utf-8", errors="replace")
+                            if self._is_unsupported_chat_endpoint_for_model(error_text):
+                                LOGGER.info(
+                                    "Model '%s' is not available on /chat/completions. Falling back to /responses.",
+                                    model,
+                                )
+                                return await self._call_via_responses(request_messages, model, headers)
+
                             if (
                                 response.status_code in self.CHAT_RETRYABLE_STATUS_CODES
                                 and attempt < self.CHAT_MAX_ATTEMPTS
@@ -342,6 +350,83 @@ class CopilotClient:
 
         raise CopilotAPIError("Copilot API call failed after retries.")
 
+    async def _call_via_responses(
+        self,
+        request_messages: list[dict[str, str]],
+        model: str,
+        headers: dict[str, str],
+    ) -> str:
+        payload = {
+            "model": model,
+            "input": request_messages,
+            "stream": False,
+        }
+        response_headers = dict(headers)
+        response_headers["Accept"] = "application/json"
+
+        for attempt in range(1, self.CHAT_MAX_ATTEMPTS + 1):
+            try:
+                async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
+                    response = await client.post(
+                        self.RESPONSES_URL,
+                        headers=response_headers,
+                        json=payload,
+                    )
+
+                if response.status_code >= 400:
+                    error_text = response.text[:500]
+                    if response.status_code in self.CHAT_RETRYABLE_STATUS_CODES and attempt < self.CHAT_MAX_ATTEMPTS:
+                        retry_delay = self._retry_delay_seconds(attempt)
+                        LOGGER.warning(
+                            "Copilot /responses transient HTTP %s on attempt %s/%s. Retrying in %.1fs.",
+                            response.status_code,
+                            attempt,
+                            self.CHAT_MAX_ATTEMPTS,
+                            retry_delay,
+                        )
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    raise CopilotAPIError(
+                        f"Copilot responses API call failed ({response.status_code}): {error_text}"
+                    )
+
+                data = response.json()
+                text = self._extract_responses_text(data)
+                if text:
+                    return text
+
+                if attempt < self.CHAT_MAX_ATTEMPTS:
+                    retry_delay = self._retry_delay_seconds(attempt)
+                    LOGGER.warning(
+                        "Copilot /responses returned empty text on attempt %s/%s. Retrying in %.1fs.",
+                        attempt,
+                        self.CHAT_MAX_ATTEMPTS,
+                        retry_delay,
+                    )
+                    await asyncio.sleep(retry_delay)
+                    continue
+
+                raise CopilotAPIError("Copilot responses API returned an empty response.")
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.NetworkError) as exc:
+                if attempt >= self.CHAT_MAX_ATTEMPTS:
+                    raise CopilotAPIError(
+                        "Could not reach the Copilot responses API after multiple attempts. "
+                        "Check your internet connection and DNS, then retry the build. "
+                        f"Last error: {exc}"
+                    ) from exc
+
+                retry_delay = self._retry_delay_seconds(attempt)
+                LOGGER.warning(
+                    "Copilot /responses network error on attempt %s/%s: %s. Retrying in %.1fs.",
+                    attempt,
+                    self.CHAT_MAX_ATTEMPTS,
+                    exc,
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+
+        raise CopilotAPIError("Copilot responses API call failed after retries.")
+
     @classmethod
     def available_models(cls) -> tuple[str, ...]:
         return cls.SUPPORTED_MODELS
@@ -394,6 +479,42 @@ class CopilotClient:
             return str(payload)[:300]
         except ValueError:
             return response.text.strip()[:300] or "No response body"
+
+    @staticmethod
+    def _is_unsupported_chat_endpoint_for_model(error_text: str) -> bool:
+        lowered = error_text.lower()
+        if "unsupported_api_for_model" in lowered:
+            return True
+        if "not accessible via the /chat/completions endpoint" in lowered:
+            return True
+        return False
+
+    @staticmethod
+    def _extract_responses_text(payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+
+        output_text = payload.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+        chunks: list[str] = []
+        output = payload.get("output")
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    text = block.get("text")
+                    if isinstance(text, str) and text:
+                        chunks.append(text)
+
+        return "".join(chunks).strip()
 
     @staticmethod
     def _retry_delay_seconds(attempt: int) -> float:
