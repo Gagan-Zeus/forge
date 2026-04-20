@@ -436,22 +436,58 @@ class BuildOrchestrator:
         if not readme_content:
             return None
 
+        section_commands = cls._extract_shell_commands_from_markdown_sections(
+            readme_content,
+            section_keywords=("test", "testing", "validation", "verify", "checks", "qa"),
+        )
+        selected = cls._filter_validation_commands(section_commands)
+        if selected:
+            return " && ".join(selected[:2])
+
+        selected = cls._filter_validation_commands(cls._extract_shell_commands_from_readme(readme_content))
+        if selected:
+            return " && ".join(selected[:2])
+        return None
+
+    @classmethod
+    def _filter_validation_commands(cls, commands: list[str]) -> list[str]:
         selected: list[str] = []
-        for command in cls._extract_shell_commands_from_readme(readme_content):
+        for command in commands:
             if not cls._looks_like_shell_command(command):
                 continue
             if not cls._is_safe_for_runner(command):
+                continue
+            if cls._is_environment_setup_command(command):
                 continue
             if cls._is_install_command(command) or cls._is_interactive_command(command):
                 continue
             if cls._is_validation_command(command):
                 selected.append(command)
+        return selected
 
-        if not selected:
-            return None
+    @classmethod
+    def _extract_shell_commands_from_markdown_sections(
+        cls,
+        readme_content: str,
+        section_keywords: tuple[str, ...],
+    ) -> list[str]:
+        heading_pattern = re.compile(r"^#{1,6}\s+(.+?)\s*$", flags=re.MULTILINE)
+        matches = list(heading_pattern.finditer(readme_content))
+        if not matches:
+            return []
 
-        # Keep execution bounded and deterministic.
-        return " && ".join(selected[:2])
+        commands: list[str] = []
+        for index, match in enumerate(matches):
+            title = match.group(1).strip().lower()
+            if not any(keyword in title for keyword in section_keywords):
+                continue
+
+            start = match.end()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(readme_content)
+            section_body = readme_content[start:end]
+            commands.extend(cls._extract_shell_commands_from_readme(section_body))
+
+        return commands
 
     @staticmethod
     def _extract_shell_commands_from_readme(readme_content: str) -> list[str]:
@@ -470,18 +506,23 @@ class BuildOrchestrator:
                     command = command[1:].strip()
                 if not command or command.startswith(("cd ", "export ", "set ")):
                     continue
-                if not BuildOrchestrator._looks_like_shell_command(command):
-                    continue
-                if not BuildOrchestrator._is_safe_for_runner(command):
-                    continue
-                commands.append(command)
+                segments = BuildOrchestrator._split_compound_command(command)
+                for segment in segments:
+                    if not BuildOrchestrator._looks_like_shell_command(segment):
+                        continue
+                    if not BuildOrchestrator._is_safe_for_runner(segment):
+                        continue
+                    commands.append(segment)
 
         if not commands:
             inline = re.findall(r"`([^`\n]+)`", readme_content)
             for snippet in inline:
                 command = snippet.strip()
-                if BuildOrchestrator._looks_like_shell_command(command):
-                    commands.append(command)
+                segments = BuildOrchestrator._split_compound_command(command)
+                for segment in segments:
+                    if BuildOrchestrator._looks_like_shell_command(segment):
+                        if BuildOrchestrator._is_safe_for_runner(segment):
+                            commands.append(segment)
 
         deduped: list[str] = []
         seen: set[str] = set()
@@ -555,6 +596,21 @@ class BuildOrchestrator:
             if lowered.startswith("vite build"):
                 return False
             return True
+
+        if lowered.startswith("python -m "):
+            parts = lowered.split()
+            module = parts[2] if len(parts) >= 3 else ""
+            if module in {"pytest", "unittest", "compileall", "py_compile", "mypy", "ruff"}:
+                return False
+            return True
+
+        if lowered.startswith("python ") and not lowered.startswith("python -m "):
+            parts = lowered.split()
+            if len(parts) >= 2 and parts[1].endswith(".py"):
+                script_name = Path(parts[1]).name
+                if script_name in {"run.py", "app.py", "main.py", "manage.py", "server.py", "wsgi.py"}:
+                    return True
+
         return " --watch" in lowered or " watch" in lowered or "--reload" in lowered
 
     @staticmethod
@@ -574,7 +630,41 @@ class BuildOrchestrator:
         )
         if any(token in lowered for token in validation_tokens):
             return True
-        return lowered.startswith(("python ", "go test", "cargo test", "dotnet test", "mvn test", "gradle test"))
+
+        if lowered.startswith(("go test", "cargo test", "dotnet test", "mvn test", "gradle test")):
+            return True
+
+        if lowered.startswith("python -m "):
+            parts = lowered.split()
+            module = parts[2] if len(parts) >= 3 else ""
+            return module in {"pytest", "unittest", "compileall", "py_compile", "mypy", "ruff"}
+
+        if lowered.startswith("python ") and not lowered.startswith("python -m "):
+            parts = lowered.split()
+            if len(parts) >= 2 and parts[1].endswith(".py"):
+                script_name = Path(parts[1]).name
+                if any(token in script_name for token in ("test", "check", "lint", "validate")):
+                    return True
+
+        return False
+
+    @staticmethod
+    def _is_environment_setup_command(command: str) -> bool:
+        lowered = command.lower().strip()
+        return lowered.startswith(
+            (
+                "python -m venv",
+                "virtualenv",
+                "conda create",
+                "pyenv virtualenv",
+                "pipenv --python",
+            )
+        )
+
+    @staticmethod
+    def _split_compound_command(command: str) -> list[str]:
+        parts = re.split(r"\s*(?:&&|\|\||;)\s*", command)
+        return [part.strip() for part in parts if part.strip()]
 
     @staticmethod
     def _is_safe_for_runner(command: str) -> bool:
