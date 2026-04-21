@@ -24,7 +24,7 @@ from telegram.ext import (
 
 from agent.orchestrator import BuildOrchestrator, BuildResult
 from agent.planner import ProjectPlanner
-from bot.session import SessionStore, UserSession, build_summary
+from bot.session import SessionStore, UserSession
 from models.copilot_client import CopilotAPIError, CopilotAuthError, CopilotClient
 from tools.file_writer import FileWriter
 from tools.github_pusher import GitHubPusher
@@ -435,6 +435,10 @@ async def workspace_message_handler(update: Update, context: ContextTypes.DEFAUL
             )
             return
 
+        if _looks_like_project_build_request(text):
+            await _handle_project_build_request(context.application, services, chat_id, session, text)
+            return
+
         await _handle_workspace_chat(context.application, services, chat_id, session, text)
     finally:
         typing_stop.set()
@@ -524,6 +528,110 @@ async def _handle_workspace_chat(
 
     _append_project_chat_history(session, user_text, response)
     await stream_publisher.finalize(response)
+
+
+async def _handle_project_build_request(
+    application: Application,
+    services: RuntimeServices,
+    chat_id: int,
+    session: UserSession,
+    user_text: str,
+) -> None:
+    session.idea = user_text.strip()
+    session.stack = _infer_stack_from_text(user_text)
+    session.requirements = user_text.strip()
+    session.push_to_github = _looks_like_push_request(user_text)
+    session.repo_name = ""
+    session.repo_visibility = "public" if "public" in user_text.lower() else "private"
+    session.is_building = True
+    session.build_progress = "Queued"
+
+    await _safe_send_message(application, chat_id, "Starting project build in file-by-file mode.")
+
+    async def _progress_update(message: str) -> None:
+        session.build_progress = message
+        await _safe_send_message(application, chat_id, message)
+
+    try:
+        result = await services.orchestrator.build_project(
+            chat_id=chat_id,
+            session=session,
+            progress_callback=_progress_update,
+        )
+    finally:
+        session.is_building = False
+
+    if result.success:
+        session.active_project_path = result.project_path
+        session.active_github_url = result.github_url or ""
+        session.project_context = _build_project_chat_context(copy.deepcopy(session), result)
+        warnings_text = (
+            "\nWarnings:\n" + "\n".join(f"- {item}" for item in result.warnings)
+            if result.warnings
+            else ""
+        )
+        await _safe_send_message(
+            application,
+            chat_id,
+            (
+                "Build completed.\n"
+                f"Project path: {result.project_path}\n"
+                f"Files created: {len(result.files_created)}"
+                f"{warnings_text}"
+            ),
+        )
+        return
+
+    await _safe_send_message(
+        application,
+        chat_id,
+        (
+            "Build failed.\n"
+            f"Project path: {result.project_path}\n"
+            f"Error: {result.error or 'Unknown error'}"
+        ),
+    )
+
+
+def _looks_like_project_build_request(user_text: str) -> bool:
+    lowered = user_text.lower()
+    build_verbs = (
+        "build",
+        "create",
+        "generate",
+        "make",
+        "scaffold",
+        "spin up",
+    )
+    project_targets = (
+        "project",
+        "app",
+        "website",
+        "web app",
+        "frontend",
+        "backend",
+        "api",
+        "bot",
+        "dashboard",
+    )
+    has_build_verb = any(token in lowered for token in build_verbs)
+    has_project_target = any(token in lowered for token in project_targets)
+    return has_build_verb and has_project_target
+
+
+def _infer_stack_from_text(user_text: str) -> str:
+    lowered = user_text.lower()
+    if any(token in lowered for token in ("next", "next.js")):
+        return "next.js"
+    if any(token in lowered for token in ("react", "vite", "typescript", "javascript", "node")):
+        return "node/react"
+    if any(token in lowered for token in ("fastapi", "flask", "django", "python", "pytest")):
+        return "python"
+    if any(token in lowered for token in ("go", "golang")):
+        return "go"
+    if "rust" in lowered:
+        return "rust"
+    return "general"
 
 def _extract_json_object(raw_text: str) -> dict[str, Any]:
     text = raw_text.strip()

@@ -84,10 +84,11 @@ class BuildOrchestrator:
                 await self._raise_if_cancelled(cancel_event)
                 relative_path = file_item["path"]
                 description = file_item["description"]
+                await progress_callback(f"Generating {relative_path}... ({index}/{len(plan)})")
                 content = await self._generate_file_content(session, plan, relative_path, description)
                 await self._file_writer.write_file(project_dir, relative_path, content)
                 created_files.append(relative_path)
-                await progress_callback(f"Writing {relative_path}... ({index}/{len(plan)})")
+                await progress_callback(f"Saved {relative_path} ({index}/{len(plan)})")
 
             readme_content = self._load_readme_content(project_dir)
             if not readme_content:
