@@ -24,6 +24,7 @@ class CopilotAPIError(RuntimeError):
 
 class CopilotClient:
     CHAT_MAX_ATTEMPTS = 4
+    MAX_CALL_TIMEOUT_SECONDS = 300.0
 
     DEFAULT_MODELS = (
         "gpt-5.3-codex",
@@ -146,7 +147,8 @@ class CopilotClient:
                     }
 
                 session = await sdk_client.create_session(**session_kwargs)
-                event = await session.send_and_wait(prompt, timeout=self._timeout_seconds)
+                attempt_timeout = self._attempt_timeout_seconds(attempt)
+                event = await session.send_and_wait(prompt, timeout=attempt_timeout)
                 text = self._extract_assistant_text(event)
 
                 if not text:
@@ -178,12 +180,25 @@ class CopilotClient:
                         f"Details: {exc}"
                     ) from exc
 
+                is_timeout = self._looks_like_timeout_error(exc)
+                if is_timeout:
+                    LOGGER.warning(
+                        "Copilot SDK timed out on attempt %s/%s (base timeout %.1fs).",
+                        attempt,
+                        self.CHAT_MAX_ATTEMPTS,
+                        self._timeout_seconds,
+                    )
+
                 if attempt >= self.CHAT_MAX_ATTEMPTS:
+                    if is_timeout:
+                        await self._reset_sdk_client()
                     raise CopilotAPIError(
                         "Could not complete Copilot SDK request after multiple attempts. "
                         f"Last error: {exc}"
                     ) from exc
 
+                if is_timeout:
+                    await self._reset_sdk_client()
                 retry_delay = self._retry_delay_seconds(attempt)
                 LOGGER.warning(
                     "Copilot SDK network/session error on attempt %s/%s: %s. Retrying in %.1fs.",
@@ -240,6 +255,17 @@ class CopilotClient:
                 ) from exc
 
             return self._sdk_client
+
+    async def _reset_sdk_client(self) -> None:
+        async with self._client_lock:
+            if self._sdk_client is None:
+                return
+            try:
+                await self._sdk_client.stop()
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("Ignoring SDK stop failure while resetting client", exc_info=True)
+            finally:
+                self._sdk_client = None
 
     @staticmethod
     def _messages_to_prompt(messages: Sequence[dict[str, str]]) -> str:
@@ -304,6 +330,10 @@ class CopilotClient:
     def _retry_delay_seconds(attempt: int) -> float:
         return min(1.5 * (2 ** (attempt - 1)), 12.0)
 
+    def _attempt_timeout_seconds(self, attempt: int) -> float:
+        scaled_timeout = self._timeout_seconds * (1.5 ** (attempt - 1))
+        return min(scaled_timeout, self.MAX_CALL_TIMEOUT_SECONDS)
+
     @staticmethod
     def _looks_like_auth_error(exc: Exception) -> bool:
         text = str(exc).lower()
@@ -316,3 +346,10 @@ class CopilotClient:
             "no-auto-login",
         )
         return any(re.search(pattern, text) for pattern in patterns)
+
+    @staticmethod
+    def _looks_like_timeout_error(exc: Exception) -> bool:
+        if isinstance(exc, TimeoutError | asyncio.TimeoutError):
+            return True
+        text = str(exc).lower()
+        return "timeout" in text or "timed out" in text or "session.idle" in text
