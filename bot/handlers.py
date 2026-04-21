@@ -25,7 +25,7 @@ from telegram.ext import (
 from agent.fixer import BuildFixer
 from agent.orchestrator import BuildOrchestrator, BuildResult
 from agent.planner import ProjectPlanner
-from bot.session import SessionStore, UserSession
+from bot.session import SessionStore, UserSession, build_summary
 from models.copilot_client import CopilotAuthError, CopilotClient
 from tools.file_writer import FileWriter
 from tools.github_pusher import GitHubPusher
@@ -111,6 +111,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     app.bot_data["env_file"] = (Path.cwd() / ".env").resolve()
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("project", project_command))
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("reset", reset_command))
@@ -143,6 +144,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "Copilot SDK connected. Chatbot mode is active.\n"
                 f"Default model: {MODEL_LABELS.get(session.model, session.model)}\n\n"
                 "Commands:\n"
+                "/project - start project generation workflow\n"
                 "/model - change model\n"
                 "/status - show current state\n"
                 "/cancel - cancel running build\n"
@@ -187,6 +189,44 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         (
             "Session reset. Chatbot mode is active.\n"
             f"Current model: {MODEL_LABELS.get(session.model, session.model)}"
+        ),
+    )
+
+
+async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = _chat_id(update)
+    if chat_id is None:
+        return
+
+    services = _services(context)
+    session = services.sessions.get(chat_id)
+
+    if not session.is_authenticated:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "Use /start first to initialize Copilot SDK.",
+        )
+        return
+
+    if session.is_building:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "A build is already running. Use /status or /cancel.",
+        )
+        return
+
+    if session.model not in ALLOWED_MODEL_IDS:
+        session.model = DEFAULT_MODEL
+
+    _begin_project_intake(session)
+    await _safe_send_message(
+        context.application,
+        chat_id,
+        (
+            f"Project workflow started. Model locked to: {MODEL_LABELS.get(session.model, session.model)}\n"
+            "Step 1 - What project do you want to build? Describe it in detail."
         ),
     )
 
@@ -279,6 +319,17 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    if session.current_step > 0:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            (
+                f"Project workflow in progress (step {session.current_step}).\n"
+                "Continue by answering the current prompt, or send /reset to exit workflow."
+            ),
+        )
+        return
+
     projects_root = _projects_root(context.application)
     active_project = session.active_project_path or "none"
     project_count = len(_list_generated_projects(projects_root, limit=200))
@@ -315,6 +366,17 @@ async def model_selection_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     session.model = model
+    if session.current_step > 0:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            (
+                f"Selected model: {MODEL_LABELS.get(model, model)}\n"
+                "Project workflow is still active. Continue from your current step."
+            ),
+        )
+        return
+
     await _safe_send_message(context.application, chat_id, f"Selected model: {MODEL_LABELS.get(model, model)}")
 
 
@@ -346,7 +408,60 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
-        await _handle_workspace_request(context.application, services, chat_id, session, text)
+        if session.current_step == 1:
+            session.idea = text
+            session.current_step = 2
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                "Step 2 - Which language/stack? (e.g. Python, Node.js, React, FastAPI)",
+            )
+            return
+
+        if session.current_step == 2:
+            session.stack = text
+            session.current_step = 3
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                "Step 3 - Any special requirements? (libraries, constraints, architecture)\nReply 'none' to skip.",
+            )
+            return
+
+        if session.current_step == 3:
+            session.requirements = "" if text.lower() == "none" else text
+            session.current_step = 4
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                "Step 4 - Push to GitHub when done? (yes / no)",
+            )
+            return
+
+        if session.current_step == 4:
+            await _handle_step_4(context.application, chat_id, session, text)
+            return
+
+        if session.current_step == 5:
+            if text.lower() == "yes":
+                await _start_build(context.application, services, chat_id, session)
+                return
+            if text.lower() == "no":
+                _clear_project_intake_state(session)
+                await _safe_send_message(
+                    context.application,
+                    chat_id,
+                    "Build canceled. Chatbot mode is active. Send /project to start a new workflow.",
+                )
+                return
+            await _safe_send_message(context.application, chat_id, "Please answer yes or no.")
+            return
+
+        if session.active_project_path:
+            await _handle_project_chat(context.application, services, chat_id, session, text)
+            return
+
+        await _handle_workspace_chat(context.application, services, chat_id, session, text)
     finally:
         typing_stop.set()
         try:
@@ -365,6 +480,50 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
                 chat_id,
                 "A temporary error occurred. The bot is still running; please retry your last message.",
             )
+
+
+async def _handle_step_4(application: Application, chat_id: int, session: UserSession, text: str) -> None:
+    lowered = text.lower()
+
+    if session.awaiting_repo_name:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", text):
+            await _safe_send_message(
+                application,
+                chat_id,
+                "Repo name can contain only letters, numbers, dots, dashes, and underscores. Try again.",
+            )
+            return
+        session.repo_name = text
+        session.awaiting_repo_name = False
+        session.awaiting_repo_visibility = True
+        await _safe_send_message(application, chat_id, "Public or private?")
+        return
+
+    if session.awaiting_repo_visibility:
+        if lowered not in {"public", "private"}:
+            await _safe_send_message(application, chat_id, "Please answer 'public' or 'private'.")
+            return
+        session.repo_visibility = lowered
+        session.awaiting_repo_visibility = False
+        session.current_step = 5
+        await _send_confirmation(application, chat_id, session)
+        return
+
+    if lowered == "yes":
+        session.push_to_github = True
+        session.awaiting_repo_name = True
+        await _safe_send_message(application, chat_id, "Repo name?")
+        return
+
+    if lowered == "no":
+        session.push_to_github = False
+        session.repo_name = ""
+        session.repo_visibility = "private"
+        session.current_step = 5
+        await _send_confirmation(application, chat_id, session)
+        return
+
+    await _safe_send_message(application, chat_id, "Please answer yes or no.")
 
 
 async def _start_build(
@@ -428,7 +587,7 @@ async def _start_build(
                     (
                         "You are now in project follow-up chat mode. "
                         "Ask anything about this generated project (changes, fixes, explanations, next features). "
-                        "Ask me to create a new project anytime to start a fresh build."
+                        "Send /project anytime to start a brand new project workflow."
                     ),
                 )
             else:
@@ -454,6 +613,15 @@ async def _start_build(
     await _safe_send_message(application, chat_id, "Build started.")
 
 
+async def _send_confirmation(application: Application, chat_id: int, session: UserSession) -> None:
+    summary = build_summary(session)
+    await _safe_send_message(
+        application,
+        chat_id,
+        f"Step 5 - Summary\n{summary}\nReady to build? (yes / no)",
+    )
+
+
 def _clear_project_intake_state(session: UserSession) -> None:
     session.current_step = 0
     session.idea = ""
@@ -466,7 +634,21 @@ def _clear_project_intake_state(session: UserSession) -> None:
     session.awaiting_repo_visibility = False
 
 
-async def _handle_workspace_request(
+def _begin_project_intake(session: UserSession) -> None:
+    session.current_step = 1
+    session.idea = ""
+    session.stack = ""
+    session.requirements = ""
+    session.push_to_github = False
+    session.repo_name = ""
+    session.repo_visibility = "private"
+    session.awaiting_repo_name = False
+    session.awaiting_repo_visibility = False
+    session.project_chat_mode = False
+    session.chat_history.clear()
+
+
+async def _handle_workspace_chat(
     application: Application,
     services: RuntimeServices,
     chat_id: int,
@@ -489,200 +671,35 @@ async def _handle_workspace_request(
     active_project = session.active_project_path or "none"
     history_window = session.chat_history[-(PROJECT_CHAT_HISTORY_TURNS * 2) :]
 
-    if _looks_like_project_creation_request(user_text):
-        await _safe_send_message(application, chat_id, "Understood. Preparing your project build request...")
-
     prompt = (
-        "Classify and plan the workspace request. Return strict JSON only.\n"
-        "Schema:\n"
-        "{\n"
-        "  \"mode\": \"chat\" | \"create_project\" | \"project_action\",\n"
-        "  \"assistant_reply\": \"short response\",\n"
-        "  \"target_project\": \"optional project folder hint\",\n"
-        "  \"project\": {\n"
-        "    \"idea\": \"required when mode=create_project\",\n"
-        "    \"stack\": \"required when mode=create_project\",\n"
-        "    \"requirements\": \"optional\",\n"
-        "    \"push_to_github\": true | false,\n"
-        "    \"repo_name\": \"optional\",\n"
-        "    \"repo_visibility\": \"public\" | \"private\"\n"
-        "  }\n"
-        "}\n\n"
-        "Rules:\n"
-        "- Use mode=create_project when user asks to create/build/generate a new project.\n"
-        "- Use mode=project_action for edits/actions on an existing generated project.\n"
-        "- Use mode=chat for normal Q&A.\n"
-        "- Never include absolute paths.\n"
-        "- If unsure, choose mode=chat.\n\n"
+        "Respond as a workspace-aware coding chatbot.\n"
         f"Generated projects root: {projects_root}\n"
         f"Known generated projects:\n{workspace_projects_text}\n\n"
         f".env key status (values hidden):\n{env_keys_text}\n\n"
         f"Integration status:\n{integration_status_text}\n\n"
         f"Active project path: {active_project}\n\n"
-        f"Recent chat history:\n{_render_project_history(history_window)}\n\n"
-        f"Latest user message:\n{user_text}\n"
+        f"User message:\n{user_text}\n"
     )
 
     try:
-        plan_raw = await services.copilot_client.call(
-            messages=[{"role": "user", "content": prompt}],
+        response = await services.copilot_client.call(
+            messages=[*history_window, {"role": "user", "content": prompt}],
             model=selected_model,
             system_prompt=(
-                "You are a Telegram workspace orchestrator. "
+                "You are a Telegram coding assistant. "
                 "Only assume access to the generated projects directory provided in context and .env key metadata. "
-                "Do not claim access outside that directory. Return JSON only."
+                "Do not claim access outside that directory. "
+                "If GITHUB_TOKEN is set, you can suggest GitHub push operations for generated projects. "
+                "If VERCEL_TOKEN is set, acknowledge token availability; if automatic deploy wiring is not explicit, state that clearly and provide safe next steps."
             ),
         )
-        plan = _parse_workspace_plan(plan_raw, fallback_message=user_text)
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Workspace chatbot request failed for chat_id=%s", chat_id)
         await _safe_send_message(application, chat_id, f"Workspace chat failed: {exc}")
         return
 
-    mode = plan.get("mode", "chat")
-    if mode == "create_project":
-        _apply_project_request_to_session(session, plan.get("project", {}), fallback_message=user_text)
-        await _safe_send_message(
-            application,
-            chat_id,
-            (
-                "Starting project build with the following request:\n"
-                f"- Idea: {session.idea}\n"
-                f"- Stack: {session.stack}\n"
-                f"- Requirements: {session.requirements or 'none'}\n"
-                f"- Push to GitHub: {'yes' if session.push_to_github else 'no'}"
-            ),
-        )
-        await _start_build(application, services, chat_id, session)
-        return
-
-    if mode == "project_action":
-        target_hint = str(plan.get("target_project", "")).strip()
-        if target_hint:
-            resolved_project = _resolve_project_path_hint(projects_root, target_hint)
-            if resolved_project:
-                session.active_project_path = str(resolved_project)
-                session.project_context = ""
-
-        if session.active_project_path:
-            await _safe_send_message(application, chat_id, "Applying your request to the active generated project...")
-            await _handle_project_chat(application, services, chat_id, session, user_text)
-            return
-
-        await _safe_send_message(
-            application,
-            chat_id,
-            "I can modify projects, but I could not determine an active generated project. Mention the project name or ask me to create one.",
-        )
-        return
-
-    assistant_text = str(plan.get("assistant_reply", "")).strip() or "Got it."
-    _append_project_chat_history(session, user_text, assistant_text)
-    await _safe_send_message(application, chat_id, _bounded_chat_reply(assistant_text))
-
-
-def _parse_workspace_plan(raw_text: str, fallback_message: str) -> dict[str, Any]:
-    payload = _extract_json_object(raw_text)
-
-    mode = str(payload.get("mode", "chat")).strip().lower()
-    if mode not in {"chat", "create_project", "project_action"}:
-        mode = "chat"
-
-    project_raw = payload.get("project")
-    project: dict[str, Any] = project_raw if isinstance(project_raw, dict) else {}
-    idea = str(project.get("idea", "")).strip()
-    stack = str(project.get("stack", "")).strip()
-    requirements = str(project.get("requirements", "")).strip()
-    repo_name = str(project.get("repo_name", "")).strip()
-    repo_visibility = str(project.get("repo_visibility", "private")).strip().lower()
-    push_to_github = _parse_bool(project.get("push_to_github", False))
-
-    if repo_visibility not in {"public", "private"}:
-        repo_visibility = "private"
-
-    if mode == "create_project":
-        if not idea:
-            idea = fallback_message.strip() or "Build a new project"
-        if not stack:
-            stack = "web app"
-
-    return {
-        "mode": mode,
-        "assistant_reply": str(payload.get("assistant_reply", "")).strip(),
-        "target_project": str(payload.get("target_project", "")).strip(),
-        "project": {
-            "idea": idea,
-            "stack": stack,
-            "requirements": requirements,
-            "push_to_github": push_to_github,
-            "repo_name": repo_name,
-            "repo_visibility": repo_visibility,
-        },
-    }
-
-
-def _parse_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y"}
-    return False
-
-
-def _apply_project_request_to_session(
-    session: UserSession,
-    project_request: dict[str, Any],
-    fallback_message: str,
-) -> None:
-    session.current_step = 0
-    session.idea = str(project_request.get("idea", "")).strip() or fallback_message.strip() or "Build a new project"
-    session.stack = str(project_request.get("stack", "")).strip() or "web app"
-    session.requirements = str(project_request.get("requirements", "")).strip()
-    session.push_to_github = _parse_bool(project_request.get("push_to_github", False))
-
-    repo_name = str(project_request.get("repo_name", "")).strip()
-    repo_visibility = str(project_request.get("repo_visibility", "private")).strip().lower()
-    if repo_visibility not in {"public", "private"}:
-        repo_visibility = "private"
-
-    session.repo_name = repo_name
-    session.repo_visibility = repo_visibility
-    session.awaiting_repo_name = False
-    session.awaiting_repo_visibility = False
-
-
-def _resolve_project_path_hint(projects_root: Path, hint: str) -> Path | None:
-    needle = hint.strip().lower()
-    if not needle:
-        return None
-
-    candidates = _list_generated_projects(projects_root, limit=200)
-    for project in candidates:
-        if needle == project.name.lower():
-            return project
-
-    for project in candidates:
-        if needle in project.name.lower():
-            return project
-
-    return None
-
-
-def _looks_like_project_creation_request(user_text: str) -> bool:
-    lowered = user_text.lower()
-    creation_keywords = (
-        "create",
-        "build",
-        "generate",
-        "make",
-        "scaffold",
-        "start a",
-        "new project",
-    )
-    target_keywords = ("project", "app", "website", "web app", "api", "bot", "dashboard")
-    return any(word in lowered for word in creation_keywords) and any(word in lowered for word in target_keywords)
+    _append_project_chat_history(session, user_text, response)
+    await _safe_send_message(application, chat_id, _bounded_chat_reply(response))
 
 
 async def _handle_project_chat(
@@ -696,9 +713,9 @@ async def _handle_project_chat(
         await _safe_send_message(application, chat_id, "Ask a follow-up question about your generated project.")
         return
 
-    if not session.active_project_path:
+    if not session.project_context or not session.active_project_path:
         session.project_chat_mode = False
-        await _handle_workspace_request(application, services, chat_id, session, user_text)
+        await _handle_workspace_chat(application, services, chat_id, session, user_text)
         return
 
     project_root = Path(session.active_project_path).resolve()
@@ -706,7 +723,7 @@ async def _handle_project_chat(
         session.project_chat_mode = False
         session.active_project_path = ""
         session.project_context = ""
-        await _handle_workspace_request(application, services, chat_id, session, user_text)
+        await _handle_workspace_chat(application, services, chat_id, session, user_text)
         return
 
     if not session.project_context:
