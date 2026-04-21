@@ -55,7 +55,6 @@ PROJECT_FILE_TREE_MAX_CHARS = 12000
 
 @dataclass
 class _StreamedReplyState:
-    message_id: int | None = None
     buffered_text: str = ""
     rendered_text: str = ""
     last_flush_at: float = 0.0
@@ -109,41 +108,12 @@ class _StreamingChatReplyPublisher:
         if not text:
             return
 
-        if self._state.message_id is None:
-            try:
-                sent_message = await self._application.bot.send_message(chat_id=self._chat_id, text=text)
-            except TelegramError:
-                LOGGER.exception("Failed to send streamed Telegram message to chat_id=%s", self._chat_id)
-                return
-
-            self._state.message_id = sent_message.message_id
-            self._state.rendered_text = text
-            self._state.last_flush_at = now
-            return
-
         try:
-            await self._application.bot.edit_message_text(
-                chat_id=self._chat_id,
-                message_id=self._state.message_id,
-                text=text,
-            )
+            await self._application.bot.send_message(chat_id=self._chat_id, text=text)
             self._state.rendered_text = text
             self._state.last_flush_at = now
-        except TelegramError as exc:
-            if "message is not modified" in str(exc).lower():
-                self._state.rendered_text = text
-                self._state.last_flush_at = now
-                return
-            LOGGER.debug("Falling back to new streamed message for chat_id=%s", self._chat_id, exc_info=True)
-            try:
-                sent_message = await self._application.bot.send_message(chat_id=self._chat_id, text=text)
-            except TelegramError:
-                LOGGER.exception("Failed to send fallback streamed Telegram message to chat_id=%s", self._chat_id)
-                return
-
-            self._state.message_id = sent_message.message_id
-            self._state.rendered_text = text
-            self._state.last_flush_at = now
+        except TelegramError:
+            LOGGER.exception("Failed to send streamed Telegram message to chat_id=%s", self._chat_id)
 
 
 @dataclass
