@@ -64,7 +64,7 @@ class BuildOrchestrator:
         cancel_event = asyncio.Event()
         self._cancel_events[chat_id] = cancel_event
 
-        project_name = self._derive_project_name(session)
+        project_name = await self._derive_project_name(session)
         project_dir = self._file_writer.create_project_dir(project_name)
         created_files: list[str] = []
         warnings: list[str] = []
@@ -276,12 +276,89 @@ class BuildOrchestrator:
             return fenced.group(1)
         return stripped
 
+    async def _derive_project_name(self, session: UserSession) -> str:
+        if session.repo_name.strip():
+            sanitized_repo_name = self._sanitize_project_name(session.repo_name)
+            if sanitized_repo_name:
+                return sanitized_repo_name
+
+        prompt = (
+            "Suggest a concise and relevant project folder name for this request.\n"
+            "Return only one kebab-case name.\n"
+            "Rules:\n"
+            "- 2 to 5 words\n"
+            "- lowercase letters and hyphen only\n"
+            "- no numbers\n"
+            "- no quotes, markdown, or explanation\n\n"
+            f"Project request: {session.idea}\n"
+            f"Stack: {session.stack or 'general'}\n"
+            f"Requirements: {session.requirements or 'none'}\n"
+        )
+        try:
+            response = await self._copilot_client.call(
+                messages=[{"role": "user", "content": prompt}],
+                model=session.model,
+                system_prompt="You generate precise software project names.",
+            )
+            first_line = response.strip().splitlines()[0] if response.strip() else ""
+            suggested_name = self._sanitize_project_name(first_line)
+            if suggested_name:
+                return suggested_name
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Could not derive project name from model; falling back to heuristic.", exc_info=True)
+
+        return self._fallback_project_name(session.idea)
+
     @staticmethod
-    def _derive_project_name(session: UserSession) -> str:
-        if session.repo_name:
-            return session.repo_name
-        words = [word for word in re.split(r"\W+", session.idea.lower()) if word]
-        return "-".join(words[:4]) or "generated-project"
+    def _sanitize_project_name(raw_name: str) -> str:
+        lowered = raw_name.strip().lower()
+        lowered = lowered.replace("_", "-").replace(" ", "-")
+        lowered = re.sub(r"[^a-z-]+", "-", lowered)
+        lowered = re.sub(r"-+", "-", lowered).strip("-")
+        if not lowered:
+            return ""
+        parts = [part for part in lowered.split("-") if part]
+        if len(parts) > 5:
+            parts = parts[:5]
+        return "-".join(parts)
+
+    @classmethod
+    def _fallback_project_name(cls, idea: str) -> str:
+        words = [word for word in re.split(r"\W+", idea.lower()) if word]
+        stop_words = {
+            "a",
+            "an",
+            "the",
+            "and",
+            "or",
+            "contains",
+            "contain",
+            "single",
+            "file",
+            "files",
+            "saying",
+            "just",
+            "only",
+            "no",
+            "to",
+            "for",
+            "with",
+            "that",
+            "this",
+            "new",
+            "create",
+            "build",
+            "generate",
+            "make",
+            "project",
+            "app",
+            "okay",
+            "please",
+        }
+        filtered = [word for word in words if word not in stop_words and word.isalpha()]
+        candidate_words = filtered[:4] if filtered else words[:4]
+        candidate = cls._sanitize_project_name("-".join(candidate_words))
+        return candidate or "generated-project"
 
     @classmethod
     def _pick_install_command(

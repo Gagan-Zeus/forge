@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
 from pathlib import Path
-from uuid import uuid4
 
 import aiofiles
 
@@ -14,13 +12,22 @@ class FileWriter:
         self.projects_dir.mkdir(parents=True, exist_ok=True)
 
     def create_project_dir(self, project_name: str) -> Path:
-        slug = re.sub(r"[^a-zA-Z0-9]+", "-", project_name).strip("-").lower()
+        slug = re.sub(r"[^a-zA-Z]+", "-", project_name).strip("-").lower()
         safe_slug = slug if slug else "generated-project"
-        timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
-        suffix = uuid4().hex[:6]
-        project_dir = self.projects_dir / f"{safe_slug}-{timestamp}-{suffix}"
-        project_dir.mkdir(parents=True, exist_ok=False)
-        return project_dir
+
+        base_dir = self.projects_dir / safe_slug
+        if not base_dir.exists():
+            base_dir.mkdir(parents=True, exist_ok=False)
+            return base_dir
+
+        suffix_index = 1
+        while True:
+            suffix = self._alpha_suffix(suffix_index)
+            project_dir = self.projects_dir / f"{safe_slug}-{suffix}"
+            if not project_dir.exists():
+                project_dir.mkdir(parents=True, exist_ok=False)
+                return project_dir
+            suffix_index += 1
 
     async def write_file(self, project_root: Path, relative_path: str, content: str) -> Path:
         target_path = self._resolve_safe_path(project_root, relative_path)
@@ -43,3 +50,13 @@ class FileWriter:
         except ValueError as exc:
             raise ValueError(f"Unsafe path outside project root: {relative_path}") from exc
         return target
+
+    @staticmethod
+    def _alpha_suffix(index: int) -> str:
+        letters: list[str] = []
+        value = index
+        while value > 0:
+            value -= 1
+            letters.append(chr(ord("a") + (value % 26)))
+            value //= 26
+        return "".join(reversed(letters))
