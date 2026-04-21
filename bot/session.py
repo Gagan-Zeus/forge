@@ -9,7 +9,7 @@ class UserSession:
     current_step: int = 0
     idea: str = ""
     stack: str = ""
-    model: str = ""
+    model: str = "gpt-5-mini"
     requirements: str = ""
     push_to_github: bool = False
     repo_name: str = ""

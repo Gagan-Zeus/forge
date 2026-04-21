@@ -26,25 +26,13 @@ class CopilotClient:
     CHAT_MAX_ATTEMPTS = 4
 
     DEFAULT_MODELS = (
-        "gpt-5",
-        "gpt-5.2",
-        "gpt-5.2-codex",
         "gpt-5.3-codex",
+        "gpt-5.2-codex",
+        "gpt-5.2",
         "gpt-5.4-mini",
-        "gpt-5.1",
-        "gpt-5.1-codex",
-        "gpt-5.1-codex-mini",
-        "gpt-5.1-codex-max",
         "gpt-5-mini",
-        "gpt-4o-mini",
-        "gpt-4o",
-        "claude-sonnet-4.5",
-        "claude-opus-4.5",
+        "gpt-4.1",
         "claude-haiku-4.5",
-        "gemini-2.5-pro",
-        "gemini-3-pro",
-        "gemini-3-flash",
-        "grok-code-fast-1",
     )
 
     _known_models: tuple[str, ...] = DEFAULT_MODELS
@@ -136,7 +124,7 @@ class CopilotClient:
     async def call(
         self,
         messages: Sequence[dict[str, str]],
-        model: str = "gpt-5",
+        model: str = "gpt-5-mini",
         system_prompt: str | None = None,
     ) -> str:
         await self.ensure_ready()

@@ -50,28 +50,32 @@ Authenticate your local Copilot CLI once:
 copilot auth login
 ```
 
-Then run the bot and send `/start`. The bot checks CLI auth state through the SDK and loads available models dynamically.
+Then run the bot and send `/start`. The bot checks CLI auth state through the SDK and enters chatbot mode.
 
 ## Example Conversation (ASCII)
 
 ```text
 You: /start
-Bot: Copilot SDK connected. Send me your project idea to get started.
+Bot: Copilot SDK connected. Chatbot mode is active.
+Bot: Default model: GPT-5 Mini
+You: /model
+Bot: Current model: GPT-5 Mini
+Bot: Choose a model: [buttons]
+You: /project
+Bot: Project workflow started. Model locked to: GPT-5 Mini
 Bot: Step 1 - What project do you want to build? Describe it in detail.
 You: Build a FastAPI task manager with JWT auth and SQLite.
 Bot: Step 2 - Which language/stack? (e.g. Python, Node.js, React, FastAPI)
 You: Python + FastAPI
-Bot: Step 3 - Which AI model?
-You: [tap GPT-4o]
-Bot: Step 4 - Any special requirements? (libraries, constraints, architecture)
+Bot: Step 3 - Any special requirements? (libraries, constraints, architecture)
 You: Use SQLAlchemy async and Alembic.
-Bot: Step 5 - Push to GitHub when done? (yes / no)
+Bot: Step 4 - Push to GitHub when done? (yes / no)
 You: yes
 Bot: Repo name?
 You: fastapi-task-manager
 Bot: Public or private?
 You: private
-Bot: Step 6 - Summary ... Ready to build? (yes / no)
+Bot: Step 5 - Summary ... Ready to build? (yes / no)
 You: yes
 Bot: Planning your project...
 Bot: Got the plan - building 11 files...
@@ -84,7 +88,17 @@ Bot: Done! Repo: https://github.com/<user>/<repo>
 
 ## Copilot Models
 
-Available models are loaded from the Copilot SDK (`models.list`) at runtime. The Step 3 keyboard is refreshed from the SDK model list on `/start`, and you can also type any model id manually.
+Only these models are available through `/model`, with default `gpt-5-mini`:
+
+- `gpt-5.3-codex`
+- `gpt-5.2-codex`
+- `gpt-5.2`
+- `gpt-5.4-mini`
+- `gpt-5-mini`
+- `gpt-4.1`
+- `claude-haiku-4.5`
+
+Project generation runs only when you send `/project`.
 
 ## Troubleshooting
 
@@ -98,8 +112,8 @@ Available models are loaded from the Copilot SDK (`models.list`) at runtime. The
 
 - Use `/status` to inspect progress.
 - Review the error summary sent by the bot.
-- If generated code still fails after retries, refine requirements and restart with `/reset`.
-- If a specific model fails, try another model id from Step 3 or type a model id manually.
+- If generated code still fails after retries, refine requirements and restart with `/project`.
+- If a specific model fails, switch model with `/model` and retry `/project`.
 
 ### GitHub push failed
 

@@ -32,31 +32,18 @@ from tools.shell_runner import ShellRunner
 
 LOGGER = logging.getLogger(__name__)
 
+DEFAULT_MODEL = "gpt-5-mini"
 MODEL_OPTIONS: list[tuple[str, str]] = [
+    ("GPT-5.3-Codex", "gpt-5.3-codex"),
+    ("GPT-5.2-Codex", "gpt-5.2-codex"),
     ("GPT-5.2", "gpt-5.2"),
-    ("GPT-5.2 Codex", "gpt-5.2-codex"),
-    ("GPT-5.3 Codex", "gpt-5.3-codex"),
     ("GPT-5.4 Mini", "gpt-5.4-mini"),
-    ("GPT-5.1", "gpt-5.1"),
-    ("GPT-5.1 Codex", "gpt-5.1-codex"),
-    ("GPT-5.1 Codex Mini", "gpt-5.1-codex-mini"),
-    ("GPT-5.1 Codex Max", "gpt-5.1-codex-max"),
     ("GPT-5 Mini", "gpt-5-mini"),
-    ("GPT-4o Mini", "gpt-4o-mini"),
-    ("GPT-4o", "gpt-4o"),
-    ("Grok Code Fast 1", "grok-code-fast-1"),
-    ("Claude Opus 4.5", "claude-opus-4.5"),
-    ("Claude Sonnet 4.5", "claude-sonnet-4.5"),
-    ("Claude Sonnet 4", "claude-sonnet-4"),
-    ("Claude Haiku 4.5", "claude-haiku-4.5"),
-    ("Gemini 3.1 Pro Preview", "gemini-3.1-pro-preview"),
-    ("Gemini 3 Flash Preview", "gemini-3-flash-preview"),
-    ("Gemini 2.5 Pro", "gemini-2.5-pro"),
-    ("Gemini 3 Pro", "gemini-3-pro"),
-    ("Gemini 3 Flash", "gemini-3-flash"),
     ("GPT-4.1", "gpt-4.1"),
+    ("Claude Haiku 4.5", "claude-haiku-4.5"),
 ]
 MODEL_LABELS = {value: label for label, value in MODEL_OPTIONS}
+ALLOWED_MODEL_IDS = {value for _, value in MODEL_OPTIONS}
 PROJECT_CHAT_HISTORY_TURNS = 8
 PROJECT_CHAT_MAX_REPLY_CHARS = 3500
 PROJECT_ACTION_MAX_FILES = 12
@@ -119,9 +106,12 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
         github_pusher=github_pusher,
     )
     app.bot_data["build_tasks"] = {}
-    app.bot_data["model_options"] = MODEL_OPTIONS
+    app.bot_data["projects_root"] = projects_path
+    app.bot_data["env_file"] = (Path.cwd() / ".env").resolve()
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("project", project_command))
+    app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("status", status_command))
@@ -143,14 +133,23 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         await services.copilot_client.ensure_ready()
-        await _refresh_runtime_model_options(context.application, services.copilot_client)
         session.is_authenticated = True
+        session.model = DEFAULT_MODEL
+        _clear_project_intake_state(session)
         await _safe_send_message(
             context.application,
             chat_id,
-            "Copilot SDK connected. Send me your project idea to get started.",
+            (
+                "Copilot SDK connected. Chatbot mode is active.\n"
+                f"Default model: {MODEL_LABELS.get(session.model, session.model)}\n\n"
+                "Commands:\n"
+                "/project - start project generation workflow\n"
+                "/model - change model\n"
+                "/status - show current state\n"
+                "/cancel - cancel running build\n"
+                "/reset - reset chat state"
+            ),
         )
-        await _ask_step_1(context.application, chat_id, session)
         return
     except CopilotAuthError as exc:
         session.is_authenticated = False
@@ -177,9 +176,102 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     services = _services(context)
-    services.sessions.reset(chat_id, keep_auth=False)
-    await _safe_send_message(context.application, chat_id, "Session reset.")
-    await start_command(update, context)
+    previous = services.sessions.get(chat_id)
+    preserved_model = previous.model if previous.model in ALLOWED_MODEL_IDS else DEFAULT_MODEL
+    session = services.sessions.reset(chat_id, keep_auth=True)
+    session.model = preserved_model
+    session.is_authenticated = previous.is_authenticated
+    _clear_project_intake_state(session)
+    await _safe_send_message(
+        context.application,
+        chat_id,
+        (
+            "Session reset. Chatbot mode is active.\n"
+            f"Current model: {MODEL_LABELS.get(session.model, session.model)}"
+        ),
+    )
+
+
+async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = _chat_id(update)
+    if chat_id is None:
+        return
+
+    services = _services(context)
+    session = services.sessions.get(chat_id)
+
+    if not session.is_authenticated:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "Use /start first to initialize Copilot SDK.",
+        )
+        return
+
+    if session.is_building:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "A build is already running. Use /status or /cancel.",
+        )
+        return
+
+    if session.model not in ALLOWED_MODEL_IDS:
+        session.model = DEFAULT_MODEL
+
+    _begin_project_intake(session)
+    await _safe_send_message(
+        context.application,
+        chat_id,
+        (
+            f"Project workflow started. Model locked to: {MODEL_LABELS.get(session.model, session.model)}\n"
+            "Step 1 - What project do you want to build? Describe it in detail."
+        ),
+    )
+
+
+async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = _chat_id(update)
+    if chat_id is None:
+        return
+
+    services = _services(context)
+    session = services.sessions.get(chat_id)
+
+    if not session.is_authenticated:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "Use /start first to initialize Copilot SDK.",
+        )
+        return
+
+    chosen = _resolve_model_choice(" ".join(context.args or []))
+    if chosen:
+        session.model = chosen
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            f"Model set to {MODEL_LABELS.get(chosen, chosen)}.",
+        )
+        return
+
+    if context.args:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "Unsupported model. Select one from the list below.",
+        )
+
+    await _safe_send_message(
+        context.application,
+        chat_id,
+        (
+            f"Current model: {MODEL_LABELS.get(session.model, session.model)}\n"
+            "Choose a model:"
+        ),
+        reply_markup=_model_keyboard(),
+    )
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -226,22 +318,30 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    if session.project_chat_mode:
+    if session.current_step > 0:
         await _safe_send_message(
             context.application,
             chat_id,
             (
-                "Project chat mode is active. "
-                "Ask follow-up questions about your latest generated project. "
-                "Send /start to begin a new project intake."
+                f"Project workflow in progress (step {session.current_step}).\n"
+                "Continue by answering the current prompt, or send /reset to exit workflow."
             ),
         )
         return
 
+    projects_root = _projects_root(context.application)
+    active_project = session.active_project_path or "none"
+    project_count = len(_list_generated_projects(projects_root, limit=200))
     await _safe_send_message(
         context.application,
         chat_id,
-        f"Current step: {session.current_step}\nAuthenticated: {'yes' if session.is_authenticated else 'no'}",
+        (
+            "Chatbot mode is active.\n"
+            f"Authenticated: {'yes' if session.is_authenticated else 'no'}\n"
+            f"Current model: {MODEL_LABELS.get(session.model, session.model)}\n"
+            f"Generated projects: {project_count}\n"
+            f"Active project: {active_project}"
+        ),
     )
 
 
@@ -259,27 +359,24 @@ async def model_selection_callback(update: Update, context: ContextTypes.DEFAULT
         await _safe_send_message(context.application, chat_id, "Please authenticate first with /start.")
         return
 
-    if session.current_step != 3:
-        await _safe_send_message(context.application, chat_id, "Model selection is not expected right now.")
-        return
-
     model = (query.data or "").split(":", maxsplit=1)[-1]
-    available = set(services.copilot_client.available_models())
-    if available and model not in available:
+    if model not in ALLOWED_MODEL_IDS:
         await _safe_send_message(context.application, chat_id, "Unsupported model choice.")
         return
 
     session.model = model
-    session.current_step = 4
-    await _safe_send_message(
-        context.application,
-        chat_id,
-        (
-            f"Selected model: {MODEL_LABELS.get(model, model)}\n"
-            "Step 4 - Any special requirements? (libraries, constraints, architecture)\n"
-            "Reply 'none' to skip."
-        ),
-    )
+    if session.current_step > 0:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            (
+                f"Selected model: {MODEL_LABELS.get(model, model)}\n"
+                "Project workflow is still active. Continue from your current step."
+            ),
+        )
+        return
+
+    await _safe_send_message(context.application, chat_id, f"Selected model: {MODEL_LABELS.get(model, model)}")
 
 
 async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -307,10 +404,6 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    if session.project_chat_mode and session.current_step == 0:
-        await _handle_project_chat(context.application, services, chat_id, session, text)
-        return
-
     if session.current_step == 1:
         session.idea = text
         session.current_step = 2
@@ -324,69 +417,47 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if session.current_step == 2:
         session.stack = text
         session.current_step = 3
-        model_hint = "Select a model from buttons or type a model id manually."
         await _safe_send_message(
             context.application,
             chat_id,
-            f"Step 3 - Which AI model?\n{model_hint}",
-            reply_markup=_model_keyboard(_runtime_model_options(context.application)),
+            "Step 3 - Any special requirements? (libraries, constraints, architecture)\nReply 'none' to skip.",
         )
         return
 
     if session.current_step == 3:
-        typed_model = text.strip()
-        if not typed_model:
-            await _safe_send_message(context.application, chat_id, "Provide a model id or tap one from the buttons.")
-            return
-
-        known = set(services.copilot_client.available_models())
-        if known and typed_model not in known:
-            await _safe_send_message(
-                context.application,
-                chat_id,
-                (
-                    "Model is not currently in the CLI-discovered list. "
-                    "I will still try to use it."
-                ),
-            )
-        session.model = typed_model
+        session.requirements = "" if text.lower() == "none" else text
         session.current_step = 4
         await _safe_send_message(
             context.application,
             chat_id,
-            (
-                f"Selected model: {typed_model}\n"
-                "Step 4 - Any special requirements? (libraries, constraints, architecture)\n"
-                "Reply 'none' to skip."
-            ),
+            "Step 4 - Push to GitHub when done? (yes / no)",
         )
         return
 
     if session.current_step == 4:
-        session.requirements = "" if text.lower() == "none" else text
-        session.current_step = 5
-        await _safe_send_message(
-            context.application,
-            chat_id,
-            "Step 5 - Push to GitHub when done? (yes / no)",
-        )
+        await _handle_step_4(context.application, chat_id, session, text)
         return
 
     if session.current_step == 5:
-        await _handle_step_5(context.application, chat_id, session, text)
-        return
-
-    if session.current_step == 6:
         if text.lower() == "yes":
             await _start_build(context.application, services, chat_id, session)
             return
         if text.lower() == "no":
-            await _safe_send_message(context.application, chat_id, "Build canceled. Send /reset to restart intake.")
+            _clear_project_intake_state(session)
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                "Build canceled. Chatbot mode is active. Send /project to start a new workflow.",
+            )
             return
         await _safe_send_message(context.application, chat_id, "Please answer yes or no.")
         return
 
-    await _safe_send_message(context.application, chat_id, "Use /start to begin.")
+    if session.active_project_path:
+        await _handle_project_chat(context.application, services, chat_id, session, text)
+        return
+
+    await _handle_workspace_chat(context.application, services, chat_id, session, text)
 
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -401,7 +472,7 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
             )
 
 
-async def _handle_step_5(application: Application, chat_id: int, session: UserSession, text: str) -> None:
+async def _handle_step_4(application: Application, chat_id: int, session: UserSession, text: str) -> None:
     lowered = text.lower()
 
     if session.awaiting_repo_name:
@@ -424,7 +495,7 @@ async def _handle_step_5(application: Application, chat_id: int, session: UserSe
             return
         session.repo_visibility = lowered
         session.awaiting_repo_visibility = False
-        session.current_step = 6
+        session.current_step = 5
         await _send_confirmation(application, chat_id, session)
         return
 
@@ -438,7 +509,7 @@ async def _handle_step_5(application: Application, chat_id: int, session: UserSe
         session.push_to_github = False
         session.repo_name = ""
         session.repo_visibility = "private"
-        session.current_step = 6
+        session.current_step = 5
         await _send_confirmation(application, chat_id, session)
         return
 
@@ -454,6 +525,9 @@ async def _start_build(
     if session.is_building:
         await _safe_send_message(application, chat_id, "Build is already running.")
         return
+
+    if session.model not in ALLOWED_MODEL_IDS:
+        session.model = DEFAULT_MODEL
 
     snapshot = copy.deepcopy(session)
     session.is_building = True
@@ -491,7 +565,7 @@ async def _start_build(
                     warnings,
                 ]
                 await _safe_send_message(application, chat_id, "\n".join(summary_lines))
-                live_session.current_step = 0
+                _clear_project_intake_state(live_session)
                 live_session.project_chat_mode = True
                 live_session.project_context = _build_project_chat_context(snapshot, result)
                 live_session.active_project_path = result.project_path
@@ -503,7 +577,7 @@ async def _start_build(
                     (
                         "You are now in project follow-up chat mode. "
                         "Ask anything about this generated project (changes, fixes, explanations, next features). "
-                        "I will keep this project context until you send /start."
+                        "Send /project anytime to start a brand new project workflow."
                     ),
                 )
             else:
@@ -514,11 +588,13 @@ async def _start_build(
                     chat_id,
                     f"Build failed during validation/build.\nIssue:\n{bounded_issue}",
                 )
+                _clear_project_intake_state(live_session)
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("Build task crashed for chat_id=%s", chat_id)
             live_session = services.sessions.get(chat_id)
             live_session.is_building = False
             live_session.build_progress = "Idle"
+            _clear_project_intake_state(live_session)
             await _safe_send_message(application, chat_id, f"Build crashed: {exc}")
 
     build_tasks = cast(dict[int, asyncio.Task[Any]], application.bot_data["build_tasks"])
@@ -532,24 +608,88 @@ async def _send_confirmation(application: Application, chat_id: int, session: Us
     await _safe_send_message(
         application,
         chat_id,
-        f"Step 6 - Summary\n{summary}\nReady to build? (yes / no)",
+        f"Step 5 - Summary\n{summary}\nReady to build? (yes / no)",
     )
 
 
-async def _ask_step_1(application: Application, chat_id: int, session: UserSession) -> None:
+def _clear_project_intake_state(session: UserSession) -> None:
+    session.current_step = 0
+    session.idea = ""
+    session.stack = ""
+    session.requirements = ""
+    session.push_to_github = False
+    session.repo_name = ""
+    session.repo_visibility = "private"
+    session.awaiting_repo_name = False
+    session.awaiting_repo_visibility = False
+
+
+def _begin_project_intake(session: UserSession) -> None:
     session.current_step = 1
+    session.idea = ""
+    session.stack = ""
+    session.requirements = ""
+    session.push_to_github = False
+    session.repo_name = ""
+    session.repo_visibility = "private"
     session.awaiting_repo_name = False
     session.awaiting_repo_visibility = False
     session.project_chat_mode = False
-    session.project_context = ""
-    session.active_project_path = ""
-    session.active_github_url = ""
     session.chat_history.clear()
-    await _safe_send_message(
-        application,
-        chat_id,
-        "Step 1 - What project do you want to build? Describe it in detail.",
+
+
+async def _handle_workspace_chat(
+    application: Application,
+    services: RuntimeServices,
+    chat_id: int,
+    session: UserSession,
+    user_text: str,
+) -> None:
+    if not user_text:
+        await _safe_send_message(application, chat_id, "Send a message and I will help from your generated workspace context.")
+        return
+
+    selected_model = session.model.strip()
+    if selected_model not in ALLOWED_MODEL_IDS:
+        selected_model = DEFAULT_MODEL
+
+    projects_root = _projects_root(application)
+    workspace_projects_text = _render_workspace_projects(projects_root, limit=40)
+    env_status = _load_env_key_status(_env_file_path(application))
+    env_keys_text = _render_env_key_status_lines(env_status)
+    integration_status_text = _render_integration_status(env_status)
+    active_project = session.active_project_path or "none"
+    history_window = session.chat_history[-(PROJECT_CHAT_HISTORY_TURNS * 2) :]
+
+    prompt = (
+        "Respond as a workspace-aware coding chatbot.\n"
+        f"Generated projects root: {projects_root}\n"
+        f"Known generated projects:\n{workspace_projects_text}\n\n"
+        f".env key status (values hidden):\n{env_keys_text}\n\n"
+        f"Integration status:\n{integration_status_text}\n\n"
+        f"Active project path: {active_project}\n\n"
+        f"User message:\n{user_text}\n"
     )
+
+    try:
+        response = await services.copilot_client.call(
+            messages=[*history_window, {"role": "user", "content": prompt}],
+            model=selected_model,
+            system_prompt=(
+                "You are a Telegram coding assistant. "
+                "Only assume access to the generated projects directory provided in context and .env key metadata. "
+                "Do not claim access outside that directory. "
+                "If GITHUB_TOKEN is set, you can suggest GitHub push operations for generated projects. "
+                "If VERCEL_TOKEN is set, acknowledge token availability; if automatic deploy wiring is not explicit, state that clearly and provide safe next steps."
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Workspace chatbot request failed for chat_id=%s", chat_id)
+        await _safe_send_message(application, chat_id, f"Workspace chat failed: {exc}")
+        return
+
+    _append_project_chat_history(session, user_text, response)
+    await _safe_send_message(application, chat_id, _bounded_chat_reply(response))
 
 
 async def _handle_project_chat(
@@ -565,24 +705,35 @@ async def _handle_project_chat(
 
     if not session.project_context or not session.active_project_path:
         session.project_chat_mode = False
-        await _safe_send_message(
-            application,
-            chat_id,
-            "Project context is unavailable. Send /start to begin a new build intake.",
-        )
+        await _handle_workspace_chat(application, services, chat_id, session, user_text)
         return
 
     project_root = Path(session.active_project_path).resolve()
     if not project_root.exists() or not project_root.is_dir():
         session.project_chat_mode = False
-        await _safe_send_message(
-            application,
-            chat_id,
-            "The referenced project directory no longer exists. Send /start to begin a new build intake.",
-        )
+        session.active_project_path = ""
+        session.project_context = ""
+        await _handle_workspace_chat(application, services, chat_id, session, user_text)
         return
 
-    selected_model = session.model.strip() or "gpt-5"
+    if not session.project_context:
+        session.project_context = _build_live_project_chat_context(
+            session=session,
+            project_root=project_root,
+            changed_files=[],
+            github_url=session.active_github_url,
+            warnings=[],
+        )
+
+    selected_model = session.model.strip()
+    if selected_model not in ALLOWED_MODEL_IDS:
+        selected_model = DEFAULT_MODEL
+
+    projects_root = _projects_root(application)
+    workspace_projects_text = _render_workspace_projects(projects_root, limit=40)
+    env_status = _load_env_key_status(_env_file_path(application))
+    env_keys_text = _render_env_key_status_lines(env_status)
+    integration_status_text = _render_integration_status(env_status)
 
     history_window = session.chat_history[-(PROJECT_CHAT_HISTORY_TURNS * 2) :]
     file_list = _collect_project_files(project_root, limit=PROJECT_FILE_TREE_MAX_ENTRIES)
@@ -611,6 +762,10 @@ async def _handle_project_chat(
         "- Do not include README or dependency/lock files unless user explicitly asked to modify them.\n"
         "- For HTML changes, keep CSS and JS in their own files (no inline <style> or inline <script>).\n"
         "- Use safe, non-interactive commands only.\n\n"
+        f"Generated projects root: {projects_root}\n"
+        f"Workspace project inventory:\n{workspace_projects_text}\n\n"
+        f".env key status (values hidden):\n{env_keys_text}\n\n"
+        f"Integration status:\n{integration_status_text}\n\n"
         f"Project context:\n{session.project_context}\n\n"
         f"Project files:\n{file_tree_text}\n\n"
         f"Recent project chat history:\n{history_text}\n\n"
@@ -1467,43 +1622,115 @@ def _model_keyboard(model_options: list[tuple[str, str]] | None = None) -> Inlin
     return InlineKeyboardMarkup(keyboard)
 
 
-def _runtime_model_options(application: Application) -> list[tuple[str, str]]:
-    options = application.bot_data.get("model_options")
-    if isinstance(options, list) and options:
-        return cast(list[tuple[str, str]], options)
-    return MODEL_OPTIONS
+def _resolve_model_choice(raw_choice: str) -> str | None:
+    raw = raw_choice.strip()
+    if not raw:
+        return None
+
+    normalized = raw.lower().strip()
+    normalized = re.sub(r"\s+", "-", normalized)
+    if normalized in ALLOWED_MODEL_IDS:
+        return normalized
+
+    for label, value in MODEL_OPTIONS:
+        if normalized == re.sub(r"\s+", "-", label.lower().strip()):
+            return value
+
+    return None
 
 
-async def _refresh_runtime_model_options(
-    application: Application,
-    copilot_client: CopilotClient,
-) -> list[tuple[str, str]]:
+def _projects_root(application: Application) -> Path:
+    configured = application.bot_data.get("projects_root")
+    if isinstance(configured, Path):
+        return configured.resolve()
+    return Path("./generated_projects").resolve()
+
+
+def _env_file_path(application: Application) -> Path:
+    configured = application.bot_data.get("env_file")
+    if isinstance(configured, Path):
+        return configured.resolve()
+    return (Path.cwd() / ".env").resolve()
+
+
+def _list_generated_projects(projects_root: Path, limit: int = 40) -> list[Path]:
+    if not projects_root.exists() or not projects_root.is_dir():
+        return []
+
+    projects = [
+        item.resolve()
+        for item in projects_root.iterdir()
+        if item.is_dir()
+    ]
+    projects.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+    return projects[:limit]
+
+
+def _render_workspace_projects(projects_root: Path, limit: int = 40) -> str:
+    projects = _list_generated_projects(projects_root, limit=limit)
+    if not projects:
+        return "- none"
+
+    lines: list[str] = []
+    for project in projects:
+        try:
+            relative = project.relative_to(projects_root).as_posix()
+        except ValueError:
+            relative = project.name
+        file_count = len(_collect_project_files(project, limit=PROJECT_FILE_TREE_MAX_ENTRIES))
+        lines.append(f"- {relative} ({file_count} files)")
+    return "\n".join(lines)
+
+
+def _load_env_key_status(env_file_path: Path) -> dict[str, bool]:
+    status: dict[str, bool] = {}
+    if not env_file_path.exists() or not env_file_path.is_file():
+        return status
+
     try:
-        model_ids = await copilot_client.refresh_available_models()
-    except Exception:  # noqa: BLE001
-        LOGGER.warning("Could not refresh runtime Copilot model list", exc_info=True)
-        application.bot_data["model_options"] = MODEL_OPTIONS
-        return MODEL_OPTIONS
+        raw_lines = env_file_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return status
 
-    if not model_ids:
-        application.bot_data["model_options"] = MODEL_OPTIONS
-        return MODEL_OPTIONS
+    for raw_line in raw_lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
 
-    options = [(_format_model_label(model_id), model_id) for model_id in model_ids]
-    application.bot_data["model_options"] = options
-    return options
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+
+        value = value.strip()
+        if value.startswith(("\"", "'")) and value.endswith(("\"", "'")) and len(value) >= 2:
+            value = value[1:-1]
+
+        runtime_value = os.getenv(key, value)
+        status[key] = bool(str(runtime_value).strip())
+
+    return status
 
 
-def _format_model_label(model_id: str) -> str:
-    if model_id in MODEL_LABELS:
-        return MODEL_LABELS[model_id]
+def _render_env_key_status_lines(status: dict[str, bool]) -> str:
+    if not status:
+        return "- none"
 
-    normalized = model_id.replace("-", " ").replace("_", " ").strip()
-    normalized = re.sub(r"\s+", " ", normalized)
-    titled = normalized.title() if normalized else model_id
-    if len(titled) <= 36:
-        return titled
-    return titled[:33] + "..."
+    lines = [f"- {key}: {'set' if is_set else 'not set'}" for key, is_set in sorted(status.items())]
+    return "\n".join(lines)
+
+
+def _render_integration_status(status: dict[str, bool]) -> str:
+    github_ready = status.get("GITHUB_TOKEN", False)
+    vercel_ready = status.get("VERCEL_TOKEN", False)
+    return "\n".join(
+        [
+            f"- GitHub push token available: {'yes' if github_ready else 'no'}",
+            f"- Vercel token available: {'yes' if vercel_ready else 'no'}",
+        ]
+    )
 
 
 async def _safe_send_message(
