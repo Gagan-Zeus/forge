@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import json
 import logging
@@ -188,7 +189,12 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CallbackQueryHandler(model_selection_callback, pattern=r"^model:"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, workspace_message_handler))
+    app.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
+            workspace_message_handler,
+        )
+    )
     app.add_error_handler(global_error_handler)
 
     LOGGER.info("Telegram bot is starting polling loop.")
@@ -392,8 +398,10 @@ async def workspace_message_handler(update: Update, context: ContextTypes.DEFAUL
     if not update.message:
         return
 
-    chat_id = update.message.chat_id
-    text = (update.message.text or "").strip()
+    message = update.message
+    chat_id = message.chat_id
+    text = (message.text or message.caption or "").strip()
+    image_attachments = await _extract_image_attachments_from_message(message)
     services = _services(context)
     session = services.sessions.get(chat_id)
 
@@ -420,7 +428,14 @@ async def workspace_message_handler(update: Update, context: ContextTypes.DEFAUL
             await _handle_project_build_request(context.application, services, chat_id, session, text)
             return
 
-        await _handle_workspace_chat(context.application, services, chat_id, session, text)
+        await _handle_workspace_chat(
+            context.application,
+            services,
+            chat_id,
+            session,
+            text,
+            image_attachments=image_attachments,
+        )
     finally:
         typing_stop.set()
         try:
@@ -447,8 +462,11 @@ async def _handle_workspace_chat(
     chat_id: int,
     session: UserSession,
     user_text: str,
+    image_attachments: list[dict[str, str]] | None = None,
 ) -> None:
-    if not user_text:
+    attachments = image_attachments or []
+
+    if not user_text and not attachments:
         await _safe_send_message(application, chat_id, "Send a message and I will help from your generated workspace context.")
         return
 
@@ -484,6 +502,7 @@ async def _handle_workspace_chat(
                 "If GITHUB_TOKEN is set, you can suggest GitHub push operations for generated projects. "
                 "If VERCEL_TOKEN is set, acknowledge token availability; if automatic deploy wiring is not explicit, state that clearly and provide safe next steps."
             ),
+            attachments=attachments or None,
         )
     except CopilotAPIError as exc:
         LOGGER.warning("Workspace chatbot Copilot API failure for chat_id=%s: %s", chat_id, exc)
@@ -605,6 +624,54 @@ def _infer_stack_from_text(user_text: str) -> str:
     if "rust" in lowered:
         return "rust"
     return "general"
+
+
+async def _extract_image_attachments_from_message(message: Any) -> list[dict[str, str]]:
+    attachments: list[dict[str, str]] = []
+
+    if getattr(message, "photo", None):
+        photo = message.photo[-1]
+        try:
+            telegram_file = await photo.get_file()
+            payload = await telegram_file.download_as_bytearray()
+            content = bytes(payload)
+        except TelegramError:
+            LOGGER.exception("Failed to download Telegram photo for chat_id=%s", message.chat_id)
+            content = b""
+
+        if content:
+            attachments.append(
+                {
+                    "type": "blob",
+                    "data": base64.b64encode(content).decode("ascii"),
+                    "mimeType": "image/jpeg",
+                    "displayName": f"{photo.file_unique_id}.jpg",
+                }
+            )
+
+    document = getattr(message, "document", None)
+    mime_type = str(getattr(document, "mime_type", "") or "").lower()
+    if document and mime_type.startswith("image/"):
+        try:
+            telegram_file = await document.get_file()
+            payload = await telegram_file.download_as_bytearray()
+            content = bytes(payload)
+        except TelegramError:
+            LOGGER.exception("Failed to download Telegram image document for chat_id=%s", message.chat_id)
+            content = b""
+
+        if content:
+            display_name = document.file_name or f"{document.file_unique_id}.img"
+            attachments.append(
+                {
+                    "type": "blob",
+                    "data": base64.b64encode(content).decode("ascii"),
+                    "mimeType": mime_type,
+                    "displayName": display_name,
+                }
+            )
+
+    return attachments
 
 def _extract_json_object(raw_text: str) -> dict[str, Any]:
     text = raw_text.strip()

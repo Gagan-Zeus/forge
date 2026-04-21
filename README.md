@@ -1,6 +1,8 @@
-# telegram-builder
+# Forge
 
-`telegram-builder` is a Telegram-triggered autonomous coding agent that turns a project idea into a locally generated codebase, validates it, retries fixes when needed, and can optionally create and push a GitHub repository. It now uses the GitHub Copilot SDK (Python) and the local Copilot CLI session for model access.
+An Autonomous End to End Project Builder
+
+Forge is a Telegram-triggered autonomous coding agent that turns a project idea into a locally generated codebase, validates it, retries fixes when needed, and can optionally create and push a GitHub repository. It now uses the GitHub Copilot SDK (Python) and the local Copilot CLI session for model access.
 
 ## Prerequisites
 
@@ -14,7 +16,7 @@
 
 1. Clone the repository and enter it:
    ```bash
-   git clone <your-repo-url>
+   git clone https://github.com/Gagan-Zeus/forge.git
    cd forge
    ```
 2. Create and activate a virtual environment (recommended):

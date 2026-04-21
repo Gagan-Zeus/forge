@@ -127,6 +127,7 @@ class CopilotClient:
         messages: Sequence[dict[str, str]],
         model: str = "gpt-5-mini",
         system_prompt: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         on_assistant_delta: Callable[[str], Awaitable[None] | None] | None = None,
     ) -> str:
         await self.ensure_ready()
@@ -184,7 +185,12 @@ class CopilotClient:
                 if on_assistant_delta is not None:
                     unsubscribe = session.on(_on_session_event)
                 attempt_timeout = self._attempt_timeout_seconds(attempt)
-                event = await self._send_and_wait(session=session, prompt=prompt, timeout_seconds=attempt_timeout)
+                event = await self._send_and_wait(
+                    session=session,
+                    prompt=prompt,
+                    timeout_seconds=attempt_timeout,
+                    attachments=attachments,
+                )
                 text = self._extract_assistant_text(event)
 
                 if not text:
@@ -402,9 +408,15 @@ class CopilotClient:
     def _retry_delay_seconds(attempt: int) -> float:
         return min(1.5 * (2 ** (attempt - 1)), 12.0)
 
-    async def _send_and_wait(self, session: Any, prompt: str, timeout_seconds: float | None) -> Any:
+    async def _send_and_wait(
+        self,
+        session: Any,
+        prompt: str,
+        timeout_seconds: float | None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> Any:
         if timeout_seconds is not None:
-            return await session.send_and_wait(prompt, timeout=timeout_seconds)
+            return await session.send_and_wait(prompt, attachments=attachments, timeout=timeout_seconds)
 
         idle_event = asyncio.Event()
         error_event: Exception | None = None
@@ -425,7 +437,7 @@ class CopilotClient:
 
         unsubscribe = session.on(_handler)
         try:
-            await session.send(prompt)
+            await session.send(prompt, attachments=attachments)
             await idle_event.wait()
             if error_event is not None:
                 raise error_event
