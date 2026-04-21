@@ -81,10 +81,14 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     projects_path = Path(projects_dir).resolve()
     file_writer = FileWriter(projects_path)
     shell_runner = ShellRunner(allowed_root=projects_path, timeout_seconds=120)
-    copilot_client = CopilotClient(tokens_path=Path("auth") / "tokens.json")
+    github_pat = github_token.strip()
+    copilot_client = CopilotClient(
+        timeout_seconds=120.0,
+        cli_path=os.getenv("COPILOT_CLI_PATH", ""),
+        github_token=github_pat,
+    )
     planner = ProjectPlanner(copilot_client)
     fixer = BuildFixer(copilot_client)
-    github_pat = github_token.strip()
 
     async def github_access_token_provider() -> str:
         if github_pat:
@@ -115,7 +119,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
         github_pusher=github_pusher,
     )
     app.bot_data["build_tasks"] = {}
-    app.bot_data["auth_tasks"] = {}
+    app.bot_data["model_options"] = MODEL_OPTIONS
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
@@ -136,27 +140,35 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     services = _services(context)
     session = services.sessions.reset(chat_id, keep_auth=False)
-    auth_tasks = _task_store(context, "auth_tasks")
 
-    if await _has_valid_auth(services.copilot_client):
+    try:
+        await services.copilot_client.ensure_ready()
+        await _refresh_runtime_model_options(context.application, services.copilot_client)
         session.is_authenticated = True
         await _safe_send_message(
             context.application,
             chat_id,
-            "Copilot already connected. Send me your project idea to get started.",
+            "Copilot SDK connected. Send me your project idea to get started.",
         )
         await _ask_step_1(context.application, chat_id, session)
         return
-
-    session.auth_in_progress = True
-    await _safe_send_message(context.application, chat_id, "Starting GitHub Copilot connection...")
-
-    previous_task = auth_tasks.get(chat_id)
-    if previous_task and not previous_task.done():
-        previous_task.cancel()
-
-    task = asyncio.create_task(_run_auth_flow(context.application, services, chat_id))
-    auth_tasks[chat_id] = task
+    except CopilotAuthError as exc:
+        session.is_authenticated = False
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            (
+                "Copilot SDK is not ready.\n"
+                "1) Install GitHub Copilot CLI if missing\n"
+                "2) Run `copilot auth login` in terminal\n"
+                "3) Send /start again\n\n"
+                f"Details: {exc}"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        session.is_authenticated = False
+        LOGGER.exception("Copilot SDK initialization failed for chat_id=%s", chat_id)
+        await _safe_send_message(context.application, chat_id, f"Copilot SDK initialization failed: {exc}")
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -199,8 +211,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     services = _services(context)
     session = services.sessions.get(chat_id)
 
-    if session.auth_in_progress:
-        await _safe_send_message(context.application, chat_id, "Authentication is in progress.")
+    if not session.is_authenticated:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "Copilot SDK is not connected. Run /start after `copilot auth login` in terminal.",
+        )
         return
     if session.is_building:
         await _safe_send_message(
@@ -248,7 +264,8 @@ async def model_selection_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     model = (query.data or "").split(":", maxsplit=1)[-1]
-    if model not in CopilotClient.available_models():
+    available = set(services.copilot_client.available_models())
+    if available and model not in available:
         await _safe_send_message(context.application, chat_id, "Unsupported model choice.")
         return
 
@@ -275,8 +292,11 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     session = services.sessions.get(chat_id)
 
     if not session.is_authenticated:
-        wait_text = "Authentication is in progress. Please complete it in GitHub." if session.auth_in_progress else "Use /start to connect GitHub Copilot first."
-        await _safe_send_message(context.application, chat_id, wait_text)
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "Use /start to initialize Copilot SDK. If needed, run `copilot auth login` in terminal first.",
+        )
         return
 
     if session.is_building:
@@ -304,16 +324,42 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if session.current_step == 2:
         session.stack = text
         session.current_step = 3
+        model_hint = "Select a model from buttons or type a model id manually."
         await _safe_send_message(
             context.application,
             chat_id,
-            "Step 3 - Which AI model?",
-            reply_markup=_model_keyboard(),
+            f"Step 3 - Which AI model?\n{model_hint}",
+            reply_markup=_model_keyboard(_runtime_model_options(context.application)),
         )
         return
 
     if session.current_step == 3:
-        await _safe_send_message(context.application, chat_id, "Please select the model from the inline buttons.")
+        typed_model = text.strip()
+        if not typed_model:
+            await _safe_send_message(context.application, chat_id, "Provide a model id or tap one from the buttons.")
+            return
+
+        known = set(services.copilot_client.available_models())
+        if known and typed_model not in known:
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                (
+                    "Model is not currently in the CLI-discovered list. "
+                    "I will still try to use it."
+                ),
+            )
+        session.model = typed_model
+        session.current_step = 4
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            (
+                f"Selected model: {typed_model}\n"
+                "Step 4 - Any special requirements? (libraries, constraints, architecture)\n"
+                "Reply 'none' to skip."
+            ),
+        )
         return
 
     if session.current_step == 4:
@@ -353,51 +399,6 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
                 chat_id,
                 "A temporary error occurred. The bot is still running; please retry your last message.",
             )
-
-
-async def _run_auth_flow(application: Application, services: RuntimeServices, chat_id: int) -> None:
-    session = services.sessions.get(chat_id)
-
-    async def on_device_code(device_flow: Any) -> None:
-        await _safe_send_message(
-            application,
-            chat_id,
-            (
-                "To connect GitHub Copilot, go to:\n"
-                "https://github.com/login/device\n"
-                f"Enter code: {device_flow.user_code}\n"
-                "Waiting for you to authorize..."
-            ),
-        )
-
-    try:
-        await services.copilot_client.authenticate(on_device_code=on_device_code)
-        session.is_authenticated = True
-        session.auth_in_progress = False
-        await _safe_send_message(
-            application,
-            chat_id,
-            "Copilot connected! All models are now available.\nSend me your project idea to get started.",
-        )
-        await _ask_step_1(application, chat_id, session)
-    except CopilotAuthError as exc:
-        session.is_authenticated = False
-        session.auth_in_progress = False
-        LOGGER.warning("Copilot authentication rejected for chat_id=%s: %s", chat_id, exc)
-        await _safe_send_message(
-            application,
-            chat_id,
-            (
-                "Copilot authentication failed. Confirm your GitHub account has Copilot access, "
-                "then run /start again.\n"
-                f"Details: {exc}"
-            ),
-        )
-    except Exception as exc:  # noqa: BLE001
-        session.is_authenticated = False
-        session.auth_in_progress = False
-        LOGGER.exception("Copilot authentication failed for chat_id=%s", chat_id)
-        await _safe_send_message(application, chat_id, f"Copilot authentication failed: {exc}")
 
 
 async def _handle_step_5(application: Application, chat_id: int, session: UserSession, text: str) -> None:
@@ -581,7 +582,7 @@ async def _handle_project_chat(
         )
         return
 
-    selected_model = session.model if session.model in CopilotClient.available_models() else "gpt-5-mini"
+    selected_model = session.model.strip() or "gpt-5"
 
     history_window = session.chat_history[-(PROJECT_CHAT_HISTORY_TURNS * 2) :]
     file_list = _collect_project_files(project_root, limit=PROJECT_FILE_TREE_MAX_ENTRIES)
@@ -1451,35 +1452,58 @@ def _services(context: ContextTypes.DEFAULT_TYPE) -> RuntimeServices:
     return cast(RuntimeServices, context.application.bot_data["services"])
 
 
-def _task_store(context: ContextTypes.DEFAULT_TYPE, key: str) -> dict[int, asyncio.Task[Any]]:
-    return cast(dict[int, asyncio.Task[Any]], context.application.bot_data[key])
-
-
 def _chat_id(update: Update) -> int | None:
     if update.effective_chat:
         return update.effective_chat.id
     return None
 
 
-def _model_keyboard() -> InlineKeyboardMarkup:
+def _model_keyboard(model_options: list[tuple[str, str]] | None = None) -> InlineKeyboardMarkup:
+    options = model_options or MODEL_OPTIONS
     keyboard = [
         [InlineKeyboardButton(label, callback_data=f"model:{value}")]
-        for label, value in MODEL_OPTIONS
+        for label, value in options
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
-async def _has_valid_auth(copilot_client: CopilotClient) -> bool:
-    if not copilot_client.is_authenticated():
-        return False
+def _runtime_model_options(application: Application) -> list[tuple[str, str]]:
+    options = application.bot_data.get("model_options")
+    if isinstance(options, list) and options:
+        return cast(list[tuple[str, str]], options)
+    return MODEL_OPTIONS
+
+
+async def _refresh_runtime_model_options(
+    application: Application,
+    copilot_client: CopilotClient,
+) -> list[tuple[str, str]]:
     try:
-        await copilot_client.get_token()
-        return True
-    except (CopilotAuthError, TelegramError, OSError, ValueError):
-        return False
+        model_ids = await copilot_client.refresh_available_models()
     except Exception:  # noqa: BLE001
-        LOGGER.exception("Unexpected token validation failure")
-        return False
+        LOGGER.warning("Could not refresh runtime Copilot model list", exc_info=True)
+        application.bot_data["model_options"] = MODEL_OPTIONS
+        return MODEL_OPTIONS
+
+    if not model_ids:
+        application.bot_data["model_options"] = MODEL_OPTIONS
+        return MODEL_OPTIONS
+
+    options = [(_format_model_label(model_id), model_id) for model_id in model_ids]
+    application.bot_data["model_options"] = options
+    return options
+
+
+def _format_model_label(model_id: str) -> str:
+    if model_id in MODEL_LABELS:
+        return MODEL_LABELS[model_id]
+
+    normalized = model_id.replace("-", " ").replace("_", " ").strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    titled = normalized.title() if normalized else model_id
+    if len(titled) <= 36:
+        return titled
+    return titled[:33] + "..."
 
 
 async def _safe_send_message(

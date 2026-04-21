@@ -20,7 +20,6 @@ class UserSession:
     warnings: list[str] = field(default_factory=list)
     awaiting_repo_name: bool = False
     awaiting_repo_visibility: bool = False
-    auth_in_progress: bool = False
     project_chat_mode: bool = False
     project_context: str = ""
     chat_history: list[dict[str, str]] = field(default_factory=list)
@@ -40,8 +39,7 @@ class SessionStore:
     def reset(self, chat_id: int, keep_auth: bool = True) -> UserSession:
         previous = self._sessions.get(chat_id)
         is_authenticated = previous.is_authenticated if previous and keep_auth else False
-        auth_in_progress = previous.auth_in_progress if previous and keep_auth else False
-        session = UserSession(is_authenticated=is_authenticated, auth_in_progress=auth_in_progress)
+        session = UserSession(is_authenticated=is_authenticated)
         self._sessions[chat_id] = session
         return session
 

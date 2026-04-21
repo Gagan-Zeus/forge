@@ -1,11 +1,12 @@
 # telegram-builder
 
-`telegram-builder` is a Telegram-triggered autonomous coding agent that turns a project idea into a locally generated codebase, validates it, retries fixes when needed, and can optionally create and push a GitHub repository. It uses GitHub Copilot Device Flow authentication and then calls Copilot chat models to plan and generate the project files.
+`telegram-builder` is a Telegram-triggered autonomous coding agent that turns a project idea into a locally generated codebase, validates it, retries fixes when needed, and can optionally create and push a GitHub repository. It now uses the GitHub Copilot SDK (Python) and the local Copilot CLI session for model access.
 
 ## Prerequisites
 
 - Python 3.11+
 - A Telegram bot token from BotFather
+- GitHub Copilot CLI installed and available in `PATH`
 - Git installed and available in `PATH`
 - (Optional) GitHub account with permissions to create repositories
 
@@ -41,29 +42,21 @@
 python run.py
 ```
 
-## First Run Auth (GitHub Copilot Device Flow)
+## First Run Auth (Copilot SDK + CLI)
 
-On first `/start`, if `auth/tokens.json` is missing or invalid, the bot begins GitHub Device Flow:
+Authenticate your local Copilot CLI once:
 
-1. Bot sends a message with `https://github.com/login/device` and a user code.
-2. You manually open the URL and enter the code.
-3. Bot polls GitHub until authorization completes.
-4. Bot stores tokens in `auth/tokens.json` and confirms connection.
+```bash
+copilot auth login
+```
 
-Token behavior:
-- Long-lived `access_token` is stored once from OAuth device flow.
-- Short-lived Copilot token is refreshed automatically before expiry.
+Then run the bot and send `/start`. The bot checks CLI auth state through the SDK and loads available models dynamically.
 
 ## Example Conversation (ASCII)
 
 ```text
 You: /start
-Bot: To connect GitHub Copilot, go to:
-     https://github.com/login/device
-     Enter code: XXXX-XXXX
-     Waiting for you to authorize...
-Bot: Copilot connected! All models are now available.
-     Send me your project idea to get started.
+Bot: Copilot SDK connected. Send me your project idea to get started.
 Bot: Step 1 - What project do you want to build? Describe it in detail.
 You: Build a FastAPI task manager with JWT auth and SQLite.
 Bot: Step 2 - Which language/stack? (e.g. Python, Node.js, React, FastAPI)
@@ -89,28 +82,24 @@ Bot: Pushing to GitHub...
 Bot: Done! Repo: https://github.com/<user>/<repo>
 ```
 
-## Adding New Copilot Models
+## Copilot Models
 
-Model support is centralized in `models/copilot_client.py`:
-
-1. Add the model identifier to `CopilotClient.SUPPORTED_MODELS`.
-2. Add a display label + value pair in `bot/handlers.py` under `MODEL_OPTIONS`.
-3. Restart the bot.
+Available models are loaded from the Copilot SDK (`models.list`) at runtime. The Step 3 keyboard is refreshed from the SDK model list on `/start`, and you can also type any model id manually.
 
 ## Troubleshooting
 
-### Token expired / authentication issues
+### Copilot authentication issues
 
-- Delete `auth/tokens.json` and send `/start` again.
-- Ensure you complete device flow on the same GitHub account intended for Copilot.
-- If you see HTTP 403 for `copilot_internal/v2/token`, verify that account has active Copilot access (individual or organization entitlement).
+- Ensure Copilot CLI is installed and available in `PATH`.
+- Run `copilot auth login` and confirm success.
+- Send `/start` again.
 
 ### Build failed
 
 - Use `/status` to inspect progress.
 - Review the error summary sent by the bot.
 - If generated code still fails after retries, refine requirements and restart with `/reset`.
-- Some models are not served on `/chat/completions`; the client now auto-falls back to `/responses` when required.
+- If a specific model fails, try another model id from Step 3 or type a model id manually.
 
 ### GitHub push failed
 
