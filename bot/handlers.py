@@ -56,7 +56,7 @@ PROJECT_FILE_TREE_MAX_CHARS = 12000
 @dataclass
 class _StreamedReplyState:
     buffered_text: str = ""
-    rendered_text: str = ""
+    sent_text: str = ""
     last_flush_at: float = 0.0
 
 
@@ -68,7 +68,7 @@ class _StreamingChatReplyPublisher:
         self._lock = asyncio.Lock()
 
     def current_text(self) -> str:
-        return self._state.buffered_text or self._state.rendered_text
+        return self._state.buffered_text or self._state.sent_text
 
     async def push_delta(self, delta_text: str) -> None:
         if not delta_text:
@@ -76,11 +76,11 @@ class _StreamingChatReplyPublisher:
 
         async with self._lock:
             self._state.buffered_text = _bounded_chat_reply(self._state.buffered_text + delta_text)
-            if self._state.buffered_text == self._state.rendered_text:
+            if self._state.buffered_text == self._state.sent_text:
                 return
 
             now = asyncio.get_running_loop().time()
-            pending_chars = len(self._state.buffered_text) - len(self._state.rendered_text)
+            pending_chars = len(self._state.buffered_text) - len(self._state.sent_text)
             should_flush = pending_chars >= PROJECT_CHAT_STREAM_MIN_CHARS
             if not should_flush and (now - self._state.last_flush_at) >= PROJECT_CHAT_STREAM_FLUSH_SECONDS:
                 should_flush = True
@@ -88,7 +88,7 @@ class _StreamingChatReplyPublisher:
                 should_flush = True
 
             if should_flush:
-                await self._flush_locked(self._state.buffered_text, now)
+                await self._flush_locked(now)
 
     async def finalize(self, final_text: str) -> None:
         text = _bounded_chat_reply(final_text.strip())
@@ -99,21 +99,32 @@ class _StreamingChatReplyPublisher:
 
         async with self._lock:
             self._state.buffered_text = text
-            if self._state.rendered_text == text:
+            if self._state.sent_text == text:
                 return
             now = asyncio.get_running_loop().time()
-            await self._flush_locked(text, now)
+            await self._flush_locked(now)
 
-    async def _flush_locked(self, text: str, now: float) -> None:
-        if not text:
+    async def _flush_locked(self, now: float) -> None:
+        pending_text = self._pending_text(self._state.buffered_text, self._state.sent_text)
+        if not pending_text:
             return
 
         try:
-            await self._application.bot.send_message(chat_id=self._chat_id, text=text)
-            self._state.rendered_text = text
+            await self._application.bot.send_message(chat_id=self._chat_id, text=pending_text)
+            self._state.sent_text = self._state.buffered_text
             self._state.last_flush_at = now
         except TelegramError:
             LOGGER.exception("Failed to send streamed Telegram message to chat_id=%s", self._chat_id)
+
+    @staticmethod
+    def _pending_text(full_text: str, sent_text: str) -> str:
+        if not full_text:
+            return ""
+        if not sent_text:
+            return full_text
+        if full_text.startswith(sent_text):
+            return full_text[len(sent_text):]
+        return full_text
 
 
 @dataclass
@@ -462,8 +473,6 @@ async def _handle_workspace_chat(
         f"Active project path: {active_project}\n\n"
         f"User message:\n{user_text}\n"
     )
-    stream_publisher = _StreamingChatReplyPublisher(application, chat_id)
-
     try:
         response = await services.copilot_client.call(
             messages=[*history_window, {"role": "user", "content": prompt}],
@@ -475,15 +484,9 @@ async def _handle_workspace_chat(
                 "If GITHUB_TOKEN is set, you can suggest GitHub push operations for generated projects. "
                 "If VERCEL_TOKEN is set, acknowledge token availability; if automatic deploy wiring is not explicit, state that clearly and provide safe next steps."
             ),
-            on_assistant_delta=stream_publisher.push_delta,
         )
     except CopilotAPIError as exc:
         LOGGER.warning("Workspace chatbot Copilot API failure for chat_id=%s: %s", chat_id, exc)
-        partial_response = stream_publisher.current_text().strip()
-        if partial_response:
-            _append_project_chat_history(session, user_text, partial_response)
-            await stream_publisher.finalize(partial_response)
-            return
         await _safe_send_message(application, chat_id, f"Copilot request failed: {exc}")
         return
     except Exception as exc:  # noqa: BLE001
@@ -491,13 +494,13 @@ async def _handle_workspace_chat(
         await _safe_send_message(application, chat_id, f"Workspace chat failed: {exc}")
         return
 
-    response = response.strip() or stream_publisher.current_text().strip()
+    response = response.strip()
     if not response:
         await _safe_send_message(application, chat_id, "Copilot returned an empty response.")
         return
 
     _append_project_chat_history(session, user_text, response)
-    await stream_publisher.finalize(response)
+    await _safe_send_message(application, chat_id, _bounded_chat_reply(response))
 
 
 async def _handle_project_build_request(
