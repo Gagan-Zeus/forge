@@ -61,22 +61,14 @@ Bot: Default model: GPT-5 Mini
 You: /model
 Bot: Current model: GPT-5 Mini
 Bot: Choose a model: [buttons]
-You: /project
-Bot: Project workflow started. Model locked to: GPT-5 Mini
-Bot: Step 1 - What project do you want to build? Describe it in detail.
-You: Build a FastAPI task manager with JWT auth and SQLite.
-Bot: Step 2 - Which language/stack? (e.g. Python, Node.js, React, FastAPI)
-You: Python + FastAPI
-Bot: Step 3 - Any special requirements? (libraries, constraints, architecture)
-You: Use SQLAlchemy async and Alembic.
-Bot: Step 4 - Push to GitHub when done? (yes / no)
-You: yes
-Bot: Repo name?
-You: fastapi-task-manager
-Bot: Public or private?
-You: private
-Bot: Step 5 - Summary ... Ready to build? (yes / no)
-You: yes
+You: Build a FastAPI task manager with JWT auth and SQLite. Push to GitHub as private repo fastapi-task-manager.
+Bot: Understood. Preparing your project build request...
+Bot: Starting project build with the following request:
+Bot: - Idea: Build a FastAPI task manager with JWT auth and SQLite
+Bot: - Stack: Python + FastAPI
+Bot: - Requirements: none
+Bot: - Push to GitHub: yes
+Bot: Build started.
 Bot: Planning your project...
 Bot: Got the plan - building 11 files...
 Bot: Writing app/main.py... (1/11)
@@ -98,7 +90,7 @@ Only these models are available through `/model`, with default `gpt-5-mini`:
 - `gpt-4.1`
 - `claude-haiku-4.5`
 
-Project generation runs only when you send `/project`.
+Project generation can be triggered directly from normal chat requests.
 
 ## Troubleshooting
 
@@ -112,8 +104,8 @@ Project generation runs only when you send `/project`.
 
 - Use `/status` to inspect progress.
 - Review the error summary sent by the bot.
-- If generated code still fails after retries, refine requirements and restart with `/project`.
-- If a specific model fails, switch model with `/model` and retry `/project`.
+- If generated code still fails after retries, refine requirements and ask the bot to create the project again.
+- If a specific model fails, switch model with `/model` and retry your request.
 
 ### GitHub push failed
 
