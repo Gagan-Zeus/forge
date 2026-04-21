@@ -47,9 +47,104 @@ MODEL_LABELS = {value: label for label, value in MODEL_OPTIONS}
 ALLOWED_MODEL_IDS = {value for _, value in MODEL_OPTIONS}
 PROJECT_CHAT_HISTORY_TURNS = 8
 PROJECT_CHAT_MAX_REPLY_CHARS = 3500
+PROJECT_CHAT_STREAM_MIN_CHARS = 120
+PROJECT_CHAT_STREAM_FLUSH_SECONDS = 1.0
 PROJECT_ACTION_MAX_FILES = 12
 PROJECT_FILE_TREE_MAX_ENTRIES = 240
 PROJECT_FILE_TREE_MAX_CHARS = 12000
+
+
+@dataclass
+class _StreamedReplyState:
+    message_id: int | None = None
+    buffered_text: str = ""
+    rendered_text: str = ""
+    last_flush_at: float = 0.0
+
+
+class _StreamingChatReplyPublisher:
+    def __init__(self, application: Application, chat_id: int) -> None:
+        self._application = application
+        self._chat_id = chat_id
+        self._state = _StreamedReplyState()
+        self._lock = asyncio.Lock()
+
+    def current_text(self) -> str:
+        return self._state.buffered_text or self._state.rendered_text
+
+    async def push_delta(self, delta_text: str) -> None:
+        if not delta_text:
+            return
+
+        async with self._lock:
+            self._state.buffered_text = _bounded_chat_reply(self._state.buffered_text + delta_text)
+            if self._state.buffered_text == self._state.rendered_text:
+                return
+
+            now = asyncio.get_running_loop().time()
+            pending_chars = len(self._state.buffered_text) - len(self._state.rendered_text)
+            should_flush = pending_chars >= PROJECT_CHAT_STREAM_MIN_CHARS
+            if not should_flush and (now - self._state.last_flush_at) >= PROJECT_CHAT_STREAM_FLUSH_SECONDS:
+                should_flush = True
+            if not should_flush and "\n\n" in delta_text:
+                should_flush = True
+
+            if should_flush:
+                await self._flush_locked(self._state.buffered_text, now)
+
+    async def finalize(self, final_text: str) -> None:
+        text = _bounded_chat_reply(final_text.strip())
+        if not text:
+            text = self.current_text().strip()
+        if not text:
+            return
+
+        async with self._lock:
+            self._state.buffered_text = text
+            if self._state.rendered_text == text:
+                return
+            now = asyncio.get_running_loop().time()
+            await self._flush_locked(text, now)
+
+    async def _flush_locked(self, text: str, now: float) -> None:
+        if not text:
+            return
+
+        if self._state.message_id is None:
+            try:
+                sent_message = await self._application.bot.send_message(chat_id=self._chat_id, text=text)
+            except TelegramError:
+                LOGGER.exception("Failed to send streamed Telegram message to chat_id=%s", self._chat_id)
+                return
+
+            self._state.message_id = sent_message.message_id
+            self._state.rendered_text = text
+            self._state.last_flush_at = now
+            return
+
+        try:
+            await self._application.bot.edit_message_text(
+                chat_id=self._chat_id,
+                message_id=self._state.message_id,
+                text=text,
+            )
+            self._state.rendered_text = text
+            self._state.last_flush_at = now
+        except TelegramError as exc:
+            if "message is not modified" in str(exc).lower():
+                self._state.rendered_text = text
+                self._state.last_flush_at = now
+                return
+            LOGGER.debug("Falling back to new streamed message for chat_id=%s", self._chat_id, exc_info=True)
+            try:
+                sent_message = await self._application.bot.send_message(chat_id=self._chat_id, text=text)
+            except TelegramError:
+                LOGGER.exception("Failed to send fallback streamed Telegram message to chat_id=%s", self._chat_id)
+                return
+
+            self._state.message_id = sent_message.message_id
+            self._state.rendered_text = text
+            self._state.last_flush_at = now
 
 
 @dataclass
@@ -397,6 +492,7 @@ async def _handle_workspace_chat(
         f"Active project path: {active_project}\n\n"
         f"User message:\n{user_text}\n"
     )
+    stream_publisher = _StreamingChatReplyPublisher(application, chat_id)
 
     try:
         response = await services.copilot_client.call(
@@ -409,22 +505,29 @@ async def _handle_workspace_chat(
                 "If GITHUB_TOKEN is set, you can suggest GitHub push operations for generated projects. "
                 "If VERCEL_TOKEN is set, acknowledge token availability; if automatic deploy wiring is not explicit, state that clearly and provide safe next steps."
             ),
+            on_assistant_delta=stream_publisher.push_delta,
         )
     except CopilotAPIError as exc:
         LOGGER.warning("Workspace chatbot Copilot API failure for chat_id=%s: %s", chat_id, exc)
-        await _safe_send_message(
-            application,
-            chat_id,
-            "Copilot response timed out after retries. Please resend with a shorter request.",
-        )
+        partial_response = stream_publisher.current_text().strip()
+        if partial_response:
+            _append_project_chat_history(session, user_text, partial_response)
+            await stream_publisher.finalize(partial_response)
+            return
+        await _safe_send_message(application, chat_id, f"Copilot request failed: {exc}")
         return
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Workspace chatbot request failed for chat_id=%s", chat_id)
         await _safe_send_message(application, chat_id, f"Workspace chat failed: {exc}")
         return
 
+    response = response.strip() or stream_publisher.current_text().strip()
+    if not response:
+        await _safe_send_message(application, chat_id, "Copilot returned an empty response.")
+        return
+
     _append_project_chat_history(session, user_text, response)
-    await _safe_send_message(application, chat_id, _bounded_chat_reply(response))
+    await stream_publisher.finalize(response)
 
 def _extract_json_object(raw_text: str) -> dict[str, Any]:
     text = raw_text.strip()

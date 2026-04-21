@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from copilot import CopilotClient as SDKCopilotClient
@@ -127,18 +127,52 @@ class CopilotClient:
         messages: Sequence[dict[str, str]],
         model: str = "gpt-5-mini",
         system_prompt: str | None = None,
+        on_assistant_delta: Callable[[str], Awaitable[None] | None] | None = None,
     ) -> str:
         await self.ensure_ready()
         prompt = self._messages_to_prompt(messages)
+        max_attempts = 1 if on_assistant_delta else self.CHAT_MAX_ATTEMPTS
 
-        for attempt in range(1, self.CHAT_MAX_ATTEMPTS + 1):
+        for attempt in range(1, max_attempts + 1):
             session = None
+            unsubscribe = None
+            streamed_chunks: list[str] = []
+            pending_stream_tasks: set[asyncio.Task[None]] = set()
+            loop = asyncio.get_running_loop()
+
+            def _consume_stream_task(task: asyncio.Task[None]) -> None:
+                pending_stream_tasks.discard(task)
+                try:
+                    task.result()
+                except Exception:  # noqa: BLE001
+                    LOGGER.debug("Ignoring assistant delta callback failure", exc_info=True)
+
+            def _publish_stream_delta(delta_text: str) -> None:
+                if not on_assistant_delta or not delta_text:
+                    return
+                try:
+                    maybe_awaitable = on_assistant_delta(delta_text)
+                except Exception:  # noqa: BLE001
+                    LOGGER.debug("Ignoring assistant delta callback failure", exc_info=True)
+                    return
+                if asyncio.iscoroutine(maybe_awaitable):
+                    task = loop.create_task(maybe_awaitable)
+                    pending_stream_tasks.add(task)
+                    task.add_done_callback(_consume_stream_task)
+
+            def _on_session_event(event: Any) -> None:
+                delta_text = self._extract_assistant_delta_text(event)
+                if not delta_text:
+                    return
+                streamed_chunks.append(delta_text)
+                _publish_stream_delta(delta_text)
+
             try:
                 sdk_client = await self._ensure_sdk_client()
                 session_kwargs: dict[str, Any] = {
                     "on_permission_request": PermissionHandler.approve_all,
                     "model": model,
-                    "streaming": False,
+                    "streaming": on_assistant_delta is not None,
                 }
                 if system_prompt:
                     session_kwargs["system_message"] = {
@@ -147,6 +181,8 @@ class CopilotClient:
                     }
 
                 session = await sdk_client.create_session(**session_kwargs)
+                if on_assistant_delta is not None:
+                    unsubscribe = session.on(_on_session_event)
                 attempt_timeout = self._attempt_timeout_seconds(attempt)
                 event = await session.send_and_wait(prompt, timeout=attempt_timeout)
                 text = self._extract_assistant_text(event)
@@ -155,15 +191,21 @@ class CopilotClient:
                     events = await session.get_messages()
                     text = self._extract_assistant_text_from_events(events)
 
+                if not text and streamed_chunks:
+                    text = "".join(streamed_chunks).strip()
+
+                if pending_stream_tasks:
+                    await asyncio.gather(*pending_stream_tasks, return_exceptions=True)
+
                 if text:
                     return text
 
-                if attempt < self.CHAT_MAX_ATTEMPTS:
+                if attempt < max_attempts:
                     retry_delay = self._retry_delay_seconds(attempt)
                     LOGGER.warning(
                         "Copilot SDK returned an empty response on attempt %s/%s. Retrying in %.1fs.",
                         attempt,
-                        self.CHAT_MAX_ATTEMPTS,
+                        max_attempts,
                         retry_delay,
                     )
                     await asyncio.sleep(retry_delay)
@@ -185,11 +227,16 @@ class CopilotClient:
                     LOGGER.warning(
                         "Copilot SDK timed out on attempt %s/%s (base timeout %.1fs).",
                         attempt,
-                        self.CHAT_MAX_ATTEMPTS,
+                        max_attempts,
                         self._timeout_seconds,
                     )
 
-                if attempt >= self.CHAT_MAX_ATTEMPTS:
+                if attempt >= max_attempts:
+                    partial_text = "".join(streamed_chunks).strip()
+                    if partial_text:
+                        if pending_stream_tasks:
+                            await asyncio.gather(*pending_stream_tasks, return_exceptions=True)
+                        return partial_text
                     if is_timeout:
                         await self._reset_sdk_client()
                     raise CopilotAPIError(
@@ -203,12 +250,14 @@ class CopilotClient:
                 LOGGER.warning(
                     "Copilot SDK network/session error on attempt %s/%s: %s. Retrying in %.1fs.",
                     attempt,
-                    self.CHAT_MAX_ATTEMPTS,
+                    max_attempts,
                     exc,
                     retry_delay,
                 )
                 await asyncio.sleep(retry_delay)
             finally:
+                if unsubscribe is not None:
+                    unsubscribe()
                 if session is not None:
                     try:
                         if hasattr(session, "disconnect"):
@@ -316,6 +365,26 @@ class CopilotClient:
             value = data.get("content")
             if isinstance(value, str) and value.strip():
                 return value.strip()
+        return ""
+
+    @staticmethod
+    def _extract_assistant_delta_text(event: Any) -> str:
+        if event is None:
+            return ""
+
+        event_type_raw = getattr(event, "type", "")
+        event_type = getattr(event_type_raw, "value", None) or str(event_type_raw)
+        if event_type != "assistant.message_delta":
+            return ""
+
+        data = getattr(event, "data", None)
+        delta_content = getattr(data, "delta_content", None)
+        if isinstance(delta_content, str) and delta_content:
+            return delta_content
+        if isinstance(data, dict):
+            value = data.get("delta_content") or data.get("deltaContent")
+            if isinstance(value, str) and value:
+                return value
         return ""
 
     @classmethod
