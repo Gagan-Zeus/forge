@@ -22,7 +22,6 @@ from telegram.ext import (
     filters,
 )
 
-from agent.fixer import BuildFixer
 from agent.orchestrator import BuildOrchestrator, BuildResult
 from agent.planner import ProjectPlanner
 from bot.session import SessionStore, UserSession, build_summary
@@ -163,15 +162,13 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
 
     projects_path = Path(projects_dir).resolve()
     file_writer = FileWriter(projects_path)
-    shell_runner = ShellRunner(allowed_root=projects_path, timeout_seconds=120)
+    shell_runner = ShellRunner(allowed_root=projects_path)
     github_pat = github_token.strip()
     copilot_client = CopilotClient(
-        timeout_seconds=180.0,
         cli_path=os.getenv("COPILOT_CLI_PATH", ""),
         github_token=github_pat,
     )
     planner = ProjectPlanner(copilot_client)
-    fixer = BuildFixer(copilot_client)
 
     async def github_access_token_provider() -> str:
         if github_pat:
@@ -186,7 +183,6 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     orchestrator = BuildOrchestrator(
         copilot_client=copilot_client,
         planner=planner,
-        fixer=fixer,
         file_writer=file_writer,
         shell_runner=shell_runner,
         github_pusher=github_pusher,

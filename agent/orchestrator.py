@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from agent.fixer import BuildFixer
 from agent.planner import ProjectPlanner
 from bot.session import UserSession
 from models.copilot_client import CopilotClient
@@ -36,21 +35,16 @@ class BuildCancelledError(RuntimeError):
 
 
 class BuildOrchestrator:
-    MAX_FIX_ATTEMPTS_PER_FILE = 3
-    MAX_TOTAL_FIX_ATTEMPTS = 8
-
     def __init__(
         self,
         copilot_client: CopilotClient,
         planner: ProjectPlanner,
-        fixer: BuildFixer,
         file_writer: FileWriter,
         shell_runner: ShellRunner,
         github_pusher: GitHubPusher | None = None,
     ) -> None:
         self._copilot_client = copilot_client
         self._planner = planner
-        self._fixer = fixer
         self._file_writer = file_writer
         self._shell_runner = shell_runner
         self._github_pusher = github_pusher
@@ -152,23 +146,19 @@ class BuildOrchestrator:
                             validation_result = await self._shell_runner.run(validation_command, project_dir)
 
                 if not validation_result["success"]:
-                    fix_error = await self._attempt_fixes(
-                        session=session,
-                        project_dir=project_dir,
-                        created_files=created_files,
-                        validation_command=validation_command,
-                        initial_error=self._combine_output(validation_result),
-                        progress_callback=progress_callback,
+                    validation_error = self._combine_output(validation_result)
+                    return BuildResult(
+                        success=False,
+                        project_name=project_name,
+                        project_path=str(project_dir),
+                        files_created=created_files,
+                        warnings=warnings,
+                        error=(
+                            "Validation failed after file-by-file generation. "
+                            f"Issue: {self._summarize_issue(validation_error)}\n"
+                            f"Details:\n{validation_error[:2500]}"
+                        ),
                     )
-                    if fix_error:
-                        return BuildResult(
-                            success=False,
-                            project_name=project_name,
-                            project_path=str(project_dir),
-                            files_created=created_files,
-                            warnings=warnings,
-                            error=fix_error,
-                        )
             else:
                 warnings.append("Validation skipped because no command could be inferred from the stack.")
 
@@ -215,183 +205,6 @@ class BuildOrchestrator:
             )
         finally:
             self._cancel_events.pop(chat_id, None)
-
-    async def _attempt_fixes(
-        self,
-        session: UserSession,
-        project_dir: Path,
-        created_files: list[str],
-        validation_command: str,
-        initial_error: str,
-        progress_callback: ProgressCallback,
-    ) -> str | None:
-        attempts = {path: 0 for path in created_files}
-        latest_error = initial_error
-        context = self._render_project_context(session, created_files)
-        total_attempts = 0
-        repeated_error_streak = 0
-        no_change_streak = 0
-        previous_error_fingerprint = self._error_fingerprint(latest_error)
-
-        await progress_callback(f"Validation issue: {self._summarize_issue(latest_error)}")
-
-        while total_attempts < self.MAX_TOTAL_FIX_ATTEMPTS:
-            target = self._pick_target_file(latest_error, created_files, attempts)
-            if not target:
-                return (
-                    "Validation failed and no clear target file could be inferred from test output. "
-                    f"Issue: {self._summarize_issue(latest_error)}\n"
-                    f"Details:\n{latest_error[:2500]}"
-                )
-
-            attempts[target] += 1
-            total_attempts += 1
-            await progress_callback(
-                (
-                    "Found an issue, fixing... "
-                    f"target={target} "
-                    f"(attempt {attempts[target]}/{self.MAX_FIX_ATTEMPTS_PER_FILE}, "
-                    f"total {total_attempts}/{self.MAX_TOTAL_FIX_ATTEMPTS})"
-                )
-            )
-            current_content = await self._file_writer.read_file(project_dir, target)
-            fixed_content = await self._fixer.fix_file(
-                file_path=target,
-                current_content=current_content,
-                error_output=latest_error,
-                project_context=context,
-                model=session.model,
-            )
-
-            if fixed_content == current_content:
-                no_change_streak += 1
-                await progress_callback(
-                    f"Fix attempt produced no code change for {target}; trying another strategy..."
-                )
-                if no_change_streak >= 3:
-                    return (
-                        "Validation is still failing and fixes are not changing the code. "
-                        f"Issue: {self._summarize_issue(latest_error)}\n"
-                        f"Details:\n{latest_error[:2500]}"
-                    )
-
-                if all(count >= self.MAX_FIX_ATTEMPTS_PER_FILE for count in attempts.values()):
-                    return (
-                        "Validation failed after max retries (3 attempts per file). "
-                        f"Issue: {self._summarize_issue(latest_error)}\n"
-                        f"Details:\n{latest_error[:2500]}"
-                    )
-                continue
-
-            no_change_streak = 0
-            await self._file_writer.write_file(project_dir, target, fixed_content)
-
-            validation_result = await self._shell_runner.run(validation_command, project_dir)
-            if validation_result["success"]:
-                return None
-
-            latest_error = self._combine_output(validation_result)
-            await progress_callback(f"Issue after fix: {self._summarize_issue(latest_error)}")
-
-            current_error_fingerprint = self._error_fingerprint(latest_error)
-            if current_error_fingerprint == previous_error_fingerprint:
-                repeated_error_streak += 1
-            else:
-                repeated_error_streak = 0
-            previous_error_fingerprint = current_error_fingerprint
-
-            if repeated_error_streak >= 2:
-                return (
-                    "Validation is still failing with the same repeated issue after multiple fix attempts. "
-                    f"Issue: {self._summarize_issue(latest_error)}\n"
-                    f"Details:\n{latest_error[:2500]}"
-                )
-
-            if all(count >= self.MAX_FIX_ATTEMPTS_PER_FILE for count in attempts.values()):
-                return (
-                    "Validation failed after max retries (3 attempts per file). "
-                    f"Issue: {self._summarize_issue(latest_error)}\n"
-                    f"Details:\n{latest_error[:2500]}"
-                )
-
-        return (
-            "Validation failed after maximum total fix attempts. "
-            f"Issue: {self._summarize_issue(latest_error)}\n"
-            f"Details:\n{latest_error[:2500]}"
-        )
-
-    async def attempt_single_fix(
-        self,
-        session: UserSession,
-        project_dir: Path,
-        candidate_files: list[str],
-        validation_command: str,
-        initial_error: str,
-        progress_callback: ProgressCallback,
-    ) -> str | None:
-        if self._is_non_fixable_runtime_validation_error(initial_error):
-            return (
-                "Validation failed with a runtime environment issue that cannot be auto-fixed in code. "
-                f"Issue: {self._summarize_issue(initial_error)}\n"
-                f"Details:\n{initial_error[:2500]}"
-            )
-
-        fixable_files = [path for path in candidate_files if path]
-        if not fixable_files:
-            return (
-                "Validation failed and no fixable source files were selected for a follow-up fix attempt. "
-                f"Issue: {self._summarize_issue(initial_error)}\n"
-                f"Details:\n{initial_error[:2500]}"
-            )
-
-        attempts = {path: 0 for path in fixable_files}
-        context = self._render_project_context(session, fixable_files)
-
-        await progress_callback(f"Validation issue: {self._summarize_issue(initial_error)}")
-
-        target = self._pick_target_file(initial_error, fixable_files, attempts)
-        if not target:
-            return (
-                "Validation failed and no clear target file could be inferred for a single follow-up fix attempt. "
-                f"Issue: {self._summarize_issue(initial_error)}\n"
-                f"Details:\n{initial_error[:2500]}"
-            )
-
-        attempts[target] += 1
-        await progress_callback(
-            "Found an issue, fixing... "
-            f"target={target} "
-            "(attempt 1/1, total 1/1)"
-        )
-        current_content = await self._file_writer.read_file(project_dir, target)
-        fixed_content = await self._fixer.fix_file(
-            file_path=target,
-            current_content=current_content,
-            error_output=initial_error,
-            project_context=context,
-            model=session.model,
-        )
-
-        if fixed_content == current_content:
-            return (
-                "Validation is still failing and the single fix attempt produced no code change. "
-                f"Issue: {self._summarize_issue(initial_error)}\n"
-                f"Details:\n{initial_error[:2500]}"
-            )
-
-        await self._file_writer.write_file(project_dir, target, fixed_content)
-
-        validation_result = await self._shell_runner.run(validation_command, project_dir)
-        if validation_result["success"]:
-            return None
-
-        latest_error = self._combine_output(validation_result)
-        await progress_callback(f"Issue after fix: {self._summarize_issue(latest_error)}")
-        return (
-            "Validation failed after single fix attempt. "
-            f"Issue: {self._summarize_issue(latest_error)}\n"
-            f"Details:\n{latest_error[:2500]}"
-        )
 
     async def _generate_file_content(
         self,
@@ -785,20 +598,6 @@ class BuildOrchestrator:
             or "blocked command outside allowed directory" in lowered
         )
 
-    @staticmethod
-    def _is_non_fixable_runtime_validation_error(error_text: str) -> bool:
-        lowered = error_text.lower()
-        signals = (
-            "address already in use",
-            "port 5000 is in use",
-            "eaddrinuse",
-            "permission denied",
-            "operation not permitted",
-            "connection refused",
-            "network is unreachable",
-        )
-        return any(signal in lowered for signal in signals)
-
     @classmethod
     def _fallback_readme(cls, session: UserSession, created_files: list[str]) -> str:
         install_command = cls._pick_install_command(session.stack, created_files, None)
@@ -866,36 +665,6 @@ class BuildOrchestrator:
         return f"{operation.capitalize()} failed: {details[:1000]}"
 
     @staticmethod
-    def _pick_target_file(error_output: str, files: list[str], attempts: dict[str, int]) -> str | None:
-        lowered_error = error_output.lower()
-        for path in files:
-            if attempts[path] >= BuildOrchestrator.MAX_FIX_ATTEMPTS_PER_FILE:
-                continue
-            if path.lower() in lowered_error:
-                return path
-
-        for path in files:
-            if attempts[path] >= BuildOrchestrator.MAX_FIX_ATTEMPTS_PER_FILE:
-                continue
-            if Path(path).name.lower() in lowered_error:
-                return path
-
-        available = [path for path in files if attempts[path] < BuildOrchestrator.MAX_FIX_ATTEMPTS_PER_FILE]
-        if not available:
-            return None
-        return min(available, key=lambda item: attempts[item])
-
-    @staticmethod
-    def _render_project_context(session: UserSession, created_files: list[str]) -> str:
-        files_section = "\n".join(f"- {path}" for path in created_files)
-        return (
-            f"Idea: {session.idea}\n"
-            f"Stack: {session.stack}\n"
-            f"Requirements: {session.requirements or 'none'}\n"
-            f"Generated files:\n{files_section}"
-        )
-
-    @staticmethod
     async def _raise_if_cancelled(cancel_event: asyncio.Event) -> None:
         if cancel_event.is_set():
             raise BuildCancelledError
@@ -916,8 +685,3 @@ class BuildOrchestrator:
         if len(selected) <= max_chars:
             return selected
         return selected[:max_chars] + "..."
-
-    @staticmethod
-    def _error_fingerprint(error_output: str) -> str:
-        normalized = " ".join(error_output.lower().split())
-        return normalized[:500]

@@ -18,9 +18,8 @@ class ShellRunner:
         re.compile(r"\beval\b", flags=re.IGNORECASE),
     )
 
-    def __init__(self, allowed_root: str | Path, timeout_seconds: int = 120) -> None:
+    def __init__(self, allowed_root: str | Path) -> None:
         self.allowed_root = Path(allowed_root).resolve()
-        self.timeout_seconds = timeout_seconds
 
     async def run(self, command: str, cwd: str | Path) -> dict[str, Any]:
         work_dir = Path(cwd).resolve()
@@ -40,12 +39,7 @@ class ShellRunner:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=self.timeout_seconds)
-        except TimeoutError:
-            process.kill()
-            await process.communicate()
-            return self._result(False, "", "Command timed out after 120 seconds.", 124)
+        stdout, stderr = await process.communicate()
 
         output = stdout.decode("utf-8", errors="replace")
         error = stderr.decode("utf-8", errors="replace")

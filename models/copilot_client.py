@@ -40,11 +40,11 @@ class CopilotClient:
 
     def __init__(
         self,
-        timeout_seconds: float = 90.0,
+        timeout_seconds: float | None = None,
         cli_path: str | None = None,
         github_token: str | None = None,
     ) -> None:
-        self._timeout_seconds = timeout_seconds
+        self._timeout_seconds = timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
         self._cli_path = (cli_path or os.getenv("COPILOT_CLI_PATH", "")).strip() or None
         self._github_token = (github_token or "").strip()
 
@@ -184,7 +184,7 @@ class CopilotClient:
                 if on_assistant_delta is not None:
                     unsubscribe = session.on(_on_session_event)
                 attempt_timeout = self._attempt_timeout_seconds(attempt)
-                event = await session.send_and_wait(prompt, timeout=attempt_timeout)
+                event = await self._send_and_wait(session=session, prompt=prompt, timeout_seconds=attempt_timeout)
                 text = self._extract_assistant_text(event)
 
                 if not text:
@@ -224,11 +224,14 @@ class CopilotClient:
 
                 is_timeout = self._looks_like_timeout_error(exc)
                 if is_timeout:
+                    configured_timeout = (
+                        f"{self._timeout_seconds:.1f}s" if self._timeout_seconds is not None else "disabled"
+                    )
                     LOGGER.warning(
-                        "Copilot SDK timed out on attempt %s/%s (base timeout %.1fs).",
+                        "Copilot SDK timed out on attempt %s/%s (base timeout %s).",
                         attempt,
                         max_attempts,
-                        self._timeout_seconds,
+                        configured_timeout,
                     )
 
                 if attempt >= max_attempts:
@@ -399,7 +402,40 @@ class CopilotClient:
     def _retry_delay_seconds(attempt: int) -> float:
         return min(1.5 * (2 ** (attempt - 1)), 12.0)
 
-    def _attempt_timeout_seconds(self, attempt: int) -> float:
+    async def _send_and_wait(self, session: Any, prompt: str, timeout_seconds: float | None) -> Any:
+        if timeout_seconds is not None:
+            return await session.send_and_wait(prompt, timeout=timeout_seconds)
+
+        idle_event = asyncio.Event()
+        error_event: Exception | None = None
+        last_assistant_message: Any = None
+
+        def _handler(event: Any) -> None:
+            nonlocal last_assistant_message, error_event
+            event_type_raw = getattr(event, "type", "")
+            event_type = getattr(event_type_raw, "value", None) or str(event_type_raw)
+            if event_type == "assistant.message":
+                last_assistant_message = event
+            elif event_type == "session.idle":
+                idle_event.set()
+            elif event_type == "session.error":
+                message = getattr(getattr(event, "data", None), "message", str(getattr(event, "data", "")))
+                error_event = Exception(f"Session error: {message}")
+                idle_event.set()
+
+        unsubscribe = session.on(_handler)
+        try:
+            await session.send(prompt)
+            await idle_event.wait()
+            if error_event is not None:
+                raise error_event
+            return last_assistant_message
+        finally:
+            unsubscribe()
+
+    def _attempt_timeout_seconds(self, attempt: int) -> float | None:
+        if self._timeout_seconds is None:
+            return None
         scaled_timeout = self._timeout_seconds * (1.5 ** (attempt - 1))
         return min(scaled_timeout, self.MAX_CALL_TIMEOUT_SECONDS)
 
