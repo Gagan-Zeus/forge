@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -388,76 +389,85 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     services = _services(context)
     session = services.sessions.get(chat_id)
 
-    if not session.is_authenticated:
-        await _safe_send_message(
-            context.application,
-            chat_id,
-            "Use /start to initialize Copilot SDK. If needed, run `copilot auth login` in terminal first.",
-        )
-        return
-
-    if session.is_building:
-        await _safe_send_message(
-            context.application,
-            chat_id,
-            "A build is already running. Use /status to check progress or /cancel to stop it.",
-        )
-        return
-
-    if session.current_step == 1:
-        session.idea = text
-        session.current_step = 2
-        await _safe_send_message(
-            context.application,
-            chat_id,
-            "Step 2 - Which language/stack? (e.g. Python, Node.js, React, FastAPI)",
-        )
-        return
-
-    if session.current_step == 2:
-        session.stack = text
-        session.current_step = 3
-        await _safe_send_message(
-            context.application,
-            chat_id,
-            "Step 3 - Any special requirements? (libraries, constraints, architecture)\nReply 'none' to skip.",
-        )
-        return
-
-    if session.current_step == 3:
-        session.requirements = "" if text.lower() == "none" else text
-        session.current_step = 4
-        await _safe_send_message(
-            context.application,
-            chat_id,
-            "Step 4 - Push to GitHub when done? (yes / no)",
-        )
-        return
-
-    if session.current_step == 4:
-        await _handle_step_4(context.application, chat_id, session, text)
-        return
-
-    if session.current_step == 5:
-        if text.lower() == "yes":
-            await _start_build(context.application, services, chat_id, session)
-            return
-        if text.lower() == "no":
-            _clear_project_intake_state(session)
+    typing_stop = asyncio.Event()
+    typing_task = asyncio.create_task(_typing_indicator_loop(context.application, chat_id, typing_stop))
+    try:
+        if not session.is_authenticated:
             await _safe_send_message(
                 context.application,
                 chat_id,
-                "Build canceled. Chatbot mode is active. Send /project to start a new workflow.",
+                "Use /start to initialize Copilot SDK. If needed, run `copilot auth login` in terminal first.",
             )
             return
-        await _safe_send_message(context.application, chat_id, "Please answer yes or no.")
-        return
 
-    if session.active_project_path:
-        await _handle_project_chat(context.application, services, chat_id, session, text)
-        return
+        if session.is_building:
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                "A build is already running. Use /status to check progress or /cancel to stop it.",
+            )
+            return
 
-    await _handle_workspace_chat(context.application, services, chat_id, session, text)
+        if session.current_step == 1:
+            session.idea = text
+            session.current_step = 2
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                "Step 2 - Which language/stack? (e.g. Python, Node.js, React, FastAPI)",
+            )
+            return
+
+        if session.current_step == 2:
+            session.stack = text
+            session.current_step = 3
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                "Step 3 - Any special requirements? (libraries, constraints, architecture)\nReply 'none' to skip.",
+            )
+            return
+
+        if session.current_step == 3:
+            session.requirements = "" if text.lower() == "none" else text
+            session.current_step = 4
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                "Step 4 - Push to GitHub when done? (yes / no)",
+            )
+            return
+
+        if session.current_step == 4:
+            await _handle_step_4(context.application, chat_id, session, text)
+            return
+
+        if session.current_step == 5:
+            if text.lower() == "yes":
+                await _start_build(context.application, services, chat_id, session)
+                return
+            if text.lower() == "no":
+                _clear_project_intake_state(session)
+                await _safe_send_message(
+                    context.application,
+                    chat_id,
+                    "Build canceled. Chatbot mode is active. Send /project to start a new workflow.",
+                )
+                return
+            await _safe_send_message(context.application, chat_id, "Please answer yes or no.")
+            return
+
+        if session.active_project_path:
+            await _handle_project_chat(context.application, services, chat_id, session, text)
+            return
+
+        await _handle_workspace_chat(context.application, services, chat_id, session, text)
+    finally:
+        typing_stop.set()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
 
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1731,6 +1741,24 @@ def _render_integration_status(status: dict[str, bool]) -> str:
             f"- Vercel token available: {'yes' if vercel_ready else 'no'}",
         ]
     )
+
+
+async def _typing_indicator_loop(
+    application: Application,
+    chat_id: int,
+    stop_event: asyncio.Event,
+    interval_seconds: float = 4.0,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            await application.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        except TelegramError:
+            LOGGER.debug("Failed to send typing action for chat_id=%s", chat_id, exc_info=True)
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+        except TimeoutError:
+            continue
 
 
 async def _safe_send_message(
