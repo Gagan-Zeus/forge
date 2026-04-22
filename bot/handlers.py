@@ -235,7 +235,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             (
                 "Copilot SDK is not ready.\n"
                 "1) Install GitHub Copilot CLI if missing\n"
-                "2) Run `copilot auth login` in terminal\n"
+                "2) Run `copilot -i auth login` in terminal\n"
                 "3) Send /start again\n\n"
                 f"Details: {exc}"
             ),
@@ -358,12 +358,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     projects_root = _projects_root(context.application)
     active_project = session.active_project_path or "none"
     project_count = len(_list_generated_projects(projects_root, limit=200))
+    copilot_account = await services.copilot_client.get_authenticated_login()
     await _safe_send_message(
         context.application,
         chat_id,
         (
             "Chatbot mode is active.\n"
             f"Authenticated: {'yes' if session.is_authenticated else 'no'}\n"
+            f"Copilot GitHub account: {copilot_account}\n"
             f"Current model: {MODEL_LABELS.get(session.model, session.model)}\n"
             f"Generated projects: {project_count}\n"
             f"Active project: {active_project}"
@@ -412,7 +414,7 @@ async def workspace_message_handler(update: Update, context: ContextTypes.DEFAUL
             await _safe_send_message(
                 context.application,
                 chat_id,
-                "Use /start to initialize Copilot SDK. If needed, run `copilot auth login` in terminal first.",
+                "Use /start to initialize Copilot SDK. If needed, run `copilot -i auth login` in terminal first.",
             )
             return
 
@@ -1141,11 +1143,9 @@ def _render_env_key_status_lines(status: dict[str, bool]) -> str:
 
 def _render_integration_status(status: dict[str, bool]) -> str:
     github_ready = status.get("GITHUB_TOKEN", False)
-    vercel_ready = status.get("VERCEL_TOKEN", False)
     return "\n".join(
         [
             f"- GitHub push token available: {'yes' if github_ready else 'no'}",
-            f"- Vercel token available: {'yes' if vercel_ready else 'no'}",
         ]
     )
 

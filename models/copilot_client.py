@@ -23,7 +23,7 @@ class CopilotAPIError(RuntimeError):
 
 
 class CopilotClient:
-    CHAT_MAX_ATTEMPTS = 4
+    CHAT_MAX_ATTEMPTS = 1
     MAX_CALL_TIMEOUT_SECONDS = 300.0
 
     DEFAULT_MODELS = (
@@ -89,11 +89,30 @@ class CopilotClient:
             status_message = getattr(auth_status, "statusMessage", "") or "Not authenticated"
             raise CopilotAuthError(
                 "GitHub Copilot CLI is not authenticated. "
-                "Run `copilot auth login` in terminal and then send /start again. "
+                "Run `copilot -i auth login` in terminal and then send /start again. "
                 f"Status: {status_message}"
             )
 
         await self.refresh_available_models()
+
+    async def get_authenticated_login(self) -> str:
+        try:
+            sdk_client = await self._ensure_sdk_client()
+            auth_status = await sdk_client.get_auth_status()
+        except Exception:  # noqa: BLE001
+            return "unknown"
+
+        if not getattr(auth_status, "isAuthenticated", False):
+            return "not authenticated"
+
+        login = str(getattr(auth_status, "login", "") or "").strip()
+        if login:
+            return login
+
+        host = str(getattr(auth_status, "host", "") or "").strip()
+        if host:
+            return f"authenticated (login unavailable, host: {host})"
+        return "authenticated (login unavailable)"
 
     async def refresh_available_models(self) -> tuple[str, ...]:
         sdk_client = await self._ensure_sdk_client()
