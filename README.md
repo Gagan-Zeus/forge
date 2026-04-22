@@ -36,7 +36,7 @@ Forge is a Telegram-triggered autonomous coding agent that turns a project idea 
    - `TELEGRAM_BOT_TOKEN`
    - `GITHUB_USERNAME`
    - `GITHUB_TOKEN` (recommended for GitHub push; PAT with repo permissions)
-   - `PROJECTS_DIR` (default: `./generated_projects`)
+   - `PROJECTS_DIR` (Change to your Preffered Directory. default: `./generated_projects`)
 
 ## How To Run
 
