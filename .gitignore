@@ -4,3 +4,4 @@ generated_projects/
 __pycache__/
 *.pyc
 .venv/
+.forge/

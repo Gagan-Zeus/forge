@@ -44,6 +44,26 @@ Forge is a Telegram-triggered autonomous coding agent that turns a project idea 
 python run.py
 ```
 
+## Easier Daily Run (Background)
+
+If you do not want to keep a terminal tab occupied, use the helper script:
+
+```bash
+./scripts/forgectl.sh start
+```
+
+Useful commands:
+
+```bash
+./scripts/forgectl.sh status
+./scripts/forgectl.sh logs
+./scripts/forgectl.sh stop
+```
+
+Notes:
+- The script uses `.venv/bin/python` automatically when available.
+- Runtime files are stored in `.forge/` (`forge.pid`, `forge.log`).
+
 ## First Run Auth (Copilot SDK + CLI)
 
 Authenticate your local Copilot CLI once:
