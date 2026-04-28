@@ -82,6 +82,7 @@ Bot: Copilot SDK connected. Chatbot mode is active.
 Bot: Default model: GPT-5 Mini
 Bot: Commands:
 Bot: /model - change model
+Bot: /project <prompt> - build a project
 Bot: /status - show current state
 Bot: /cancel - cancel running build
 Bot: /reset - reset chat state
@@ -101,6 +102,13 @@ Only these models are available through `/model`, with default `gpt-5-mini`:
 - `gpt-5-mini`
 - `gpt-4.1`
 - `claude-haiku-4.5`
+
+## Project Build Command
+
+Project generation runs **only** through `/project`.
+
+- Example: `/project build a hello world html page`
+- Regular chat messages (even if they mention "project", "build", or similar terms) stay in normal Copilot chat mode.
 
 ## Troubleshooting
 

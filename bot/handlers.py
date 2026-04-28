@@ -185,6 +185,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("model", model_command))
+    app.add_handler(CommandHandler("project", project_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("status", status_command))
@@ -221,6 +222,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 f"Default model: {MODEL_LABELS.get(session.model, session.model)}\n\n"
                 "Commands:\n"
                 "/model - change model\n"
+                "/project <prompt> - build a project from prompt\n"
                 "/status - show current state\n"
                 "/cancel - cancel running build\n"
                 "/reset - reset chat state"
@@ -308,6 +310,48 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "Choose a model:"
         ),
         reply_markup=_model_keyboard(),
+    )
+
+
+async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = _chat_id(update)
+    if chat_id is None:
+        return
+
+    services = _services(context)
+    session = services.sessions.get(chat_id)
+
+    if not session.is_authenticated:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "Use /start first to initialize Copilot SDK.",
+        )
+        return
+
+    if session.is_building:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "A build is already running. Use /status to check progress or /cancel to stop it.",
+        )
+        return
+
+    project_prompt = " ".join(context.args or []).strip()
+    if not project_prompt:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "Usage: /project <build prompt>\nExample: /project build a hello world html page",
+        )
+        return
+
+    await _handle_project_build_request(
+        context.application,
+        services,
+        chat_id,
+        session,
+        project_prompt,
     )
 
 
@@ -424,10 +468,6 @@ async def workspace_message_handler(update: Update, context: ContextTypes.DEFAUL
                 chat_id,
                 "A build is already running. Use /status to check progress or /cancel to stop it.",
             )
-            return
-
-        if _looks_like_project_build_request(text):
-            await _handle_project_build_request(context.application, services, chat_id, session, text)
             return
 
         await _handle_workspace_chat(
@@ -585,32 +625,6 @@ async def _handle_project_build_request(
             f"Error: {result.error or 'Unknown error'}"
         ),
     )
-
-
-def _looks_like_project_build_request(user_text: str) -> bool:
-    lowered = user_text.lower()
-    build_verbs = (
-        "build",
-        "create",
-        "generate",
-        "make",
-        "scaffold",
-        "spin up",
-    )
-    project_targets = (
-        "project",
-        "app",
-        "website",
-        "web app",
-        "frontend",
-        "backend",
-        "api",
-        "bot",
-        "dashboard",
-    )
-    has_build_verb = any(token in lowered for token in build_verbs)
-    has_project_target = any(token in lowered for token in project_targets)
-    return has_build_verb and has_project_target
 
 
 def _infer_stack_from_text(user_text: str) -> str:
