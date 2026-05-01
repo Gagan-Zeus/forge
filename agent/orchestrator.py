@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from agent.planner import ProjectPlanner
+from agent.planner import ProjectPlan, ProjectPlanner
 from bot.session import UserSession
 from models.copilot_client import CopilotClient
 from tools.file_writer import FileWriter
@@ -35,6 +36,10 @@ class BuildCancelledError(RuntimeError):
 
 
 class BuildOrchestrator:
+    MAX_FIX_ATTEMPTS = 3
+    MAX_CONTEXT_FILE_CHARS = 6000
+    MAX_CONTEXT_FILES = 8
+
     def __init__(
         self,
         copilot_client: CopilotClient,
@@ -67,101 +72,170 @@ class BuildOrchestrator:
         project_name = await self._derive_project_name(session)
         project_dir = self._file_writer.create_project_dir(project_name)
         created_files: list[str] = []
+        generated_contents: dict[str, str] = {}
         warnings: list[str] = []
+        validation_status = "not run"
 
         try:
-            await progress_callback("Planning your project...")
-            plan = await self._planner.plan_files(
+            await self._report_status(progress_callback, "PLAN", "Creating project plan...")
+            project_plan = await self._planner.plan_project(
                 idea=session.idea,
                 stack=session.stack,
                 requirements=session.requirements,
                 model=session.model,
             )
             await self._raise_if_cancelled(cancel_event)
+            await self._report_status(
+                progress_callback,
+                "PLAN",
+                self._render_plan_message(project_plan=project_plan),
+            )
 
-            await progress_callback(f"Got the plan - building {len(plan)} files...")
-            for index, file_item in enumerate(plan, start=1):
+            await self._report_status(
+                progress_callback,
+                "BUILD",
+                f"Generating files incrementally ({len(project_plan.files)} planned)...",
+            )
+            build_files = [item for item in project_plan.files if item["path"].strip().lower() != "readme.md"]
+            for index, file_item in enumerate(build_files, start=1):
                 await self._raise_if_cancelled(cancel_event)
                 relative_path = file_item["path"]
                 description = file_item["description"]
-                await progress_callback(f"Generating {relative_path}... ({index}/{len(plan)})")
-                content = await self._generate_file_content(session, plan, relative_path, description)
+                await self._report_status(
+                    progress_callback,
+                    "BUILD",
+                    f"Creating {relative_path} ({index}/{len(build_files)})",
+                )
+                content = await self._generate_file_content(
+                    session=session,
+                    project_plan=project_plan,
+                    file_path=relative_path,
+                    file_description=description,
+                    generated_contents=generated_contents,
+                )
                 await self._file_writer.write_file(project_dir, relative_path, content)
                 created_files.append(relative_path)
-                await progress_callback(f"Saved {relative_path} ({index}/{len(plan)})")
+                generated_contents[relative_path] = content
+                await self._report_status(progress_callback, "BUILD", f"Created {relative_path}")
 
-            readme_content = self._load_readme_content(project_dir)
-            if not readme_content:
-                await progress_callback("README.md missing or empty. Generating required README...")
-                fallback_readme = self._fallback_readme(session, created_files)
-                await self._file_writer.write_file(project_dir, "README.md", fallback_readme)
-                if "README.md" not in created_files:
-                    created_files.append("README.md")
-                readme_content = fallback_readme
-
-            install_command = self._pick_install_command(session.stack, created_files, readme_content)
+            install_command = self._pick_install_command(session.stack, created_files, None)
             if install_command:
                 await self._raise_if_cancelled(cancel_event)
-                await progress_callback("Installing dependencies...")
+                await self._report_status(progress_callback, "VALIDATE", f"Running dependency install: {install_command}")
                 install_result = await self._shell_runner.run(install_command, project_dir)
                 if not install_result["success"]:
                     warnings.append(self._format_command_warning("dependency install", install_result))
+                    await self._report_status(
+                        progress_callback,
+                        "VALIDATE",
+                        "Dependency install failed; continuing with best-effort validation.",
+                    )
+                else:
+                    await self._report_status(progress_callback, "VALIDATE", "Dependency install completed.")
 
-            validation_command, validation_from_readme = self._pick_validation_command(
+            validation_command, _ = self._pick_validation_command(
                 session.stack,
                 created_files,
-                readme_content,
+                None,
+                package_json_content=generated_contents.get("package.json"),
             )
             if validation_command:
-                await self._raise_if_cancelled(cancel_event)
-                if validation_from_readme:
+                await self._report_status(progress_callback, "VALIDATE", "Running validation checks...")
+                validation_result = {}
+                for attempt in range(1, self.MAX_FIX_ATTEMPTS + 1):
+                    await self._raise_if_cancelled(cancel_event)
                     command_label = (
-                        validation_command
-                        if len(validation_command) <= 180
-                        else validation_command[:180] + "..."
+                        validation_command if len(validation_command) <= 180 else validation_command[:180] + "..."
                     )
-                    await progress_callback(f"Running validation from README command: {command_label}")
-                else:
-                    await progress_callback("Running validation...")
-                validation_result = await self._shell_runner.run(validation_command, project_dir)
-                if not validation_result["success"] and validation_from_readme:
-                    validation_error_text = self._combine_output(validation_result)
-                    if self._is_policy_block_error(validation_error_text):
-                        fallback_validation_command, _ = self._pick_validation_command(
-                            session.stack,
-                            created_files,
-                            None,
-                        )
-                        if fallback_validation_command and fallback_validation_command != validation_command:
-                            fallback_label = (
-                                fallback_validation_command
-                                if len(fallback_validation_command) <= 180
-                                else fallback_validation_command[:180] + "..."
-                            )
-                            await progress_callback(
-                                "README validation command was blocked by safety policy. "
-                                "Falling back to inferred validation command."
-                            )
-                            await progress_callback(f"Running fallback validation command: {fallback_label}")
-                            validation_command = fallback_validation_command
-                            validation_result = await self._shell_runner.run(validation_command, project_dir)
+                    await self._report_status(
+                        progress_callback,
+                        "VALIDATE",
+                        f"Validation attempt {attempt}/{self.MAX_FIX_ATTEMPTS}: {command_label}",
+                    )
+                    validation_result = await self._shell_runner.run(validation_command, project_dir)
+                    if validation_result["success"]:
+                        validation_status = "passed"
+                        await self._report_status(progress_callback, "VALIDATE", "Validation passed.")
+                        break
 
-                if not validation_result["success"]:
                     validation_error = self._combine_output(validation_result)
-                    return BuildResult(
-                        success=False,
-                        project_name=project_name,
-                        project_path=str(project_dir),
-                        files_created=created_files,
-                        warnings=warnings,
-                        error=(
-                            "Validation failed after file-by-file generation. "
-                            f"Issue: {self._summarize_issue(validation_error)}\n"
-                            f"Details:\n{validation_error[:2500]}"
-                        ),
+                    validation_status = "failed"
+                    await self._report_status(
+                        progress_callback,
+                        "VALIDATE",
+                        f"Validation failed: {self._summarize_issue(validation_error)}",
                     )
+                    if attempt >= self.MAX_FIX_ATTEMPTS:
+                        return BuildResult(
+                            success=False,
+                            project_name=project_name,
+                            project_path=str(project_dir),
+                            files_created=created_files,
+                            warnings=warnings,
+                            error=(
+                                "Validation failed after auto-fix attempts. "
+                                f"Issue: {self._summarize_issue(validation_error)}\n"
+                                f"Details:\n{validation_error[:2500]}"
+                            ),
+                        )
+
+                    fixed_files = await self._fix_files_from_validation_error(
+                        session=session,
+                        project_plan=project_plan,
+                        error_text=validation_error,
+                        created_files=created_files,
+                        generated_contents=generated_contents,
+                        project_dir=project_dir,
+                        progress_callback=progress_callback,
+                    )
+                    if not fixed_files:
+                        return BuildResult(
+                            success=False,
+                            project_name=project_name,
+                            project_path=str(project_dir),
+                            files_created=created_files,
+                            warnings=warnings,
+                            error=(
+                                "Validation failed and no safe fix candidates were identified. "
+                                f"Issue: {self._summarize_issue(validation_error)}\n"
+                                f"Details:\n{validation_error[:2500]}"
+                            ),
+                        )
             else:
                 warnings.append("Validation skipped because no command could be inferred from the stack.")
+                validation_status = "skipped"
+                await self._report_status(
+                    progress_callback,
+                    "VALIDATE",
+                    "Validation skipped (no suitable command inferred for this project type).",
+                )
+
+            await self._raise_if_cancelled(cancel_event)
+            await self._report_status(progress_callback, "README", "Generating README.md from actual project outputs...")
+            run_command = self._pick_run_command(session.stack, created_files)
+            readme_content = await self._generate_readme_content(
+                session=session,
+                project_plan=project_plan,
+                created_files=created_files,
+                generated_contents=generated_contents,
+                install_command=install_command,
+                run_command=run_command,
+                validation_command=validation_command,
+                validation_status=validation_status,
+            )
+            if not readme_content:
+                readme_content = self._fallback_readme(
+                    session=session,
+                    created_files=created_files,
+                    install_command=install_command,
+                    run_command=run_command,
+                    validation_command=validation_command,
+                )
+            await self._file_writer.write_file(project_dir, "README.md", readme_content)
+            generated_contents["README.md"] = readme_content
+            if "README.md" not in created_files:
+                created_files.append("README.md")
+            await self._report_status(progress_callback, "README", "Created README.md")
 
             github_url: str | None = None
             if session.push_to_github:
@@ -169,13 +243,27 @@ class BuildOrchestrator:
                     warnings.append("GitHub push skipped: pusher is not configured.")
                 else:
                     await self._raise_if_cancelled(cancel_event)
-                    await progress_callback("Pushing to GitHub...")
+                    await self._report_status(progress_callback, "FINAL", "Pushing project to GitHub...")
                     github_url = await self._github_pusher.push_project(
                         project_path=project_dir,
                         repo_name=session.repo_name,
                         visibility=session.repo_visibility,
                     )
-                    await progress_callback(f"Done! Repo: {github_url}")
+                    await self._report_status(progress_callback, "FINAL", f"GitHub push complete: {github_url}")
+
+            entrypoint = self._infer_entrypoint(created_files)
+            run_hint = run_command if run_command and not run_command.startswith("#") else "No run command inferred"
+            await self._report_status(
+                progress_callback,
+                "FINAL",
+                (
+                    "Project ready.\n"
+                    f"Name: {project_name}\n"
+                    f"Entry point: {entrypoint}\n"
+                    f"Run: {run_hint}\n"
+                    f"Validation: {validation_status}"
+                ),
+            )
 
             return BuildResult(
                 success=True,
@@ -210,15 +298,29 @@ class BuildOrchestrator:
     async def _generate_file_content(
         self,
         session: UserSession,
-        plan: list[dict[str, str]],
+        project_plan: ProjectPlan,
         file_path: str,
         file_description: str,
+        generated_contents: dict[str, str],
+        validation_error: str | None = None,
     ) -> str:
-        plan_summary = "\n".join(f"- {item['path']}: {item['description']}" for item in plan)
+        plan_summary = "\n".join(
+            f"- {item['path']}: {item['description']}" for item in project_plan.files
+        )
+        file_tree = "\n".join(f"- {item['path']}" for item in project_plan.files)
+        related_context = self._render_related_file_context(
+            target_path=file_path,
+            plan_files=project_plan.files,
+            generated_contents=generated_contents,
+        )
         prompt = (
             "Generate the full file content for the requested file.\n"
             "Return only file content without markdown fences.\n"
             "Keep production-quality style with clear error handling and type hints when relevant.\n\n"
+            "Cross-file consistency is mandatory:\n"
+            "- Keep imports, links, selectors, class names, and API routes consistent with related files.\n"
+            "- Do not invent references to files, symbols, or endpoints that are not in the plan.\n"
+            "- Preserve compatibility with files that already exist.\n\n"
             "Language boundary rules:\n"
             "- Keep each file language-pure.\n"
             "- .html files must not contain inline CSS (<style>) or inline JavaScript (<script>...</script>).\n"
@@ -227,10 +329,20 @@ class BuildOrchestrator:
             f"Project idea: {session.idea}\n"
             f"Stack: {session.stack}\n"
             f"Requirements: {session.requirements or 'none'}\n"
+            f"Project description: {project_plan.project_description}\n"
+            f"Planned features:\n{self._render_features(project_plan.features)}\n\n"
             f"All planned files:\n{plan_summary}\n\n"
+            f"Planned file tree:\n{file_tree}\n\n"
+            f"Previously written relevant files:\n{related_context}\n\n"
             f"Target file: {file_path}\n"
             f"Target purpose: {file_description}\n"
         )
+        if validation_error:
+            prompt += (
+                "\nThis file is being regenerated to fix validation failures.\n"
+                "Apply the minimal safe change needed to fix the issue while preserving existing behavior.\n"
+                f"Validation errors:\n{validation_error[:3000]}\n"
+            )
         lowered_file_path = file_path.lower()
         if lowered_file_path.endswith(".html"):
             prompt += (
@@ -267,6 +379,218 @@ class BuildOrchestrator:
             system_prompt="You are a senior software engineer producing production-ready files.",
         )
         return self._strip_markdown_fences(response)
+
+    async def _generate_readme_content(
+        self,
+        session: UserSession,
+        project_plan: ProjectPlan,
+        created_files: list[str],
+        generated_contents: dict[str, str],
+        install_command: str | None,
+        run_command: str,
+        validation_command: str | None,
+        validation_status: str,
+    ) -> str:
+        file_tree = "\n".join(f"- {path}" for path in created_files)
+        related_context = self._render_related_file_context(
+            target_path="README.md",
+            plan_files=project_plan.files,
+            generated_contents=generated_contents,
+        )
+        prompt = (
+            "Create an accurate README.md for the generated project.\n"
+            "Return only markdown content (no code fences around the entire file).\n"
+            "Use only commands and paths that truly exist in this project.\n"
+            "Do not mention tools or files that are not listed.\n\n"
+            f"Project idea: {session.idea}\n"
+            f"Project description: {project_plan.project_description}\n"
+            f"Target users: beginner developers and project users\n"
+            f"Planned features:\n{self._render_features(project_plan.features)}\n\n"
+            f"Actual file tree:\n{file_tree}\n\n"
+            "Verified commands:\n"
+            f"- Setup/install: {install_command or 'No dependency install command required'}\n"
+            f"- Run: {run_command}\n"
+            f"- Validation/tests: {validation_command or 'No validation command inferred'}\n"
+            f"- Validation status: {validation_status}\n\n"
+            f"Relevant source snippets:\n{related_context}\n\n"
+            "README requirements:\n"
+            "- Include sections: What this project is, Who it is for, Features, Tech stack.\n"
+            "- Include Setup instructions and environment variables if used.\n"
+            "- Include Run instructions and Testing/Build instructions.\n"
+            "- Include Example usage and Limitations.\n"
+            "- Keep instructions actionable and concise.\n"
+        )
+        response = await self._copilot_client.call(
+            messages=[{"role": "user", "content": prompt}],
+            model=session.model,
+            system_prompt="You write practical, accurate project documentation.",
+        )
+        return self._strip_markdown_fences(response)
+
+    async def _fix_files_from_validation_error(
+        self,
+        session: UserSession,
+        project_plan: ProjectPlan,
+        error_text: str,
+        created_files: list[str],
+        generated_contents: dict[str, str],
+        project_dir: Path,
+        progress_callback: ProgressCallback,
+    ) -> int:
+        candidates = self._select_fix_candidates(error_text=error_text, created_files=created_files)
+        if not candidates:
+            return 0
+
+        fixed_count = 0
+        for path in candidates:
+            await self._report_status(progress_callback, "VALIDATE", f"Applying fix to {path}")
+            description = self._description_for_path(project_plan.files, path)
+            updated_content = await self._generate_file_content(
+                session=session,
+                project_plan=project_plan,
+                file_path=path,
+                file_description=description,
+                generated_contents=generated_contents,
+                validation_error=error_text,
+            )
+            await self._file_writer.write_file(project_dir, path, updated_content)
+            generated_contents[path] = updated_content
+            fixed_count += 1
+            await self._report_status(progress_callback, "VALIDATE", f"Updated {path} to address validation errors")
+        return fixed_count
+
+    @classmethod
+    def _select_fix_candidates(cls, error_text: str, created_files: list[str]) -> list[str]:
+        lowered_error = error_text.lower()
+        created = [path for path in created_files if path.lower() != "readme.md"]
+        path_map = {path.lower(): path for path in created}
+
+        selected: list[str] = []
+        for lowered, original in path_map.items():
+            if lowered in lowered_error:
+                selected.append(original)
+
+        path_like_matches = re.findall(r"([a-zA-Z0-9_./-]+\.[a-zA-Z0-9]+)", error_text)
+        for match in path_like_matches:
+            key = match.lower()
+            if key in path_map:
+                selected.append(path_map[key])
+
+        if not selected:
+            selected = cls._default_fix_candidates_for_error(lowered_error, created)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in selected:
+            if item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+            if len(deduped) == 3:
+                break
+        return deduped
+
+    @staticmethod
+    def _default_fix_candidates_for_error(lowered_error: str, created: list[str]) -> list[str]:
+        if any(token in lowered_error for token in ("npm", "node", "yarn", "pnpm")):
+            preferred = [
+                path
+                for path in created
+                if Path(path).name in {"package.json", "tsconfig.json", "vite.config.ts", "vite.config.js"}
+            ]
+            preferred.extend(path for path in created if path.endswith((".js", ".jsx", ".ts", ".tsx")))
+            return preferred[:3] if preferred else created[:2]
+
+        if any(token in lowered_error for token in ("pytest", "python", "traceback", "module not found")):
+            preferred = [path for path in created if Path(path).name in {"requirements.txt", "pyproject.toml"}]
+            preferred.extend(path for path in created if path.endswith(".py"))
+            return preferred[:3] if preferred else created[:2]
+
+        return created[:2]
+
+    @staticmethod
+    def _description_for_path(plan_files: list[dict[str, str]], file_path: str) -> str:
+        for item in plan_files:
+            if item["path"] == file_path:
+                return item["description"]
+        return "Update this file to satisfy project requirements."
+
+    def _render_related_file_context(
+        self,
+        target_path: str,
+        plan_files: list[dict[str, str]],
+        generated_contents: dict[str, str],
+    ) -> str:
+        planned_paths = [item["path"] for item in plan_files]
+        candidates = self._related_paths_for_target(target_path, planned_paths, list(generated_contents))
+        if not candidates:
+            return "(No related files written yet.)"
+
+        chunks: list[str] = []
+        for path in candidates[: self.MAX_CONTEXT_FILES]:
+            content = generated_contents.get(path, "").strip()
+            if not content:
+                continue
+            snippet = content[: self.MAX_CONTEXT_FILE_CHARS]
+            chunks.append(f"### {path}\n{snippet}")
+        return "\n\n".join(chunks) if chunks else "(No related files written yet.)"
+
+    @classmethod
+    def _related_paths_for_target(
+        cls,
+        target_path: str,
+        planned_paths: list[str],
+        available_paths: list[str],
+    ) -> list[str]:
+        target = Path(target_path)
+        target_suffix = target.suffix.lower()
+        target_parent = target.parent.as_posix()
+        available = set(available_paths)
+        scored: list[tuple[int, str]] = []
+
+        for path in planned_paths:
+            if path == target_path or path not in available:
+                continue
+            score = 0
+            candidate = Path(path)
+            if candidate.parent.as_posix() == target_parent:
+                score -= 4
+            if candidate.name in {"package.json", "requirements.txt", "pyproject.toml", "tsconfig.json"}:
+                score -= 2
+            suffix = candidate.suffix.lower()
+            if target_suffix == ".html" and suffix in {".css", ".js", ".ts"}:
+                score -= 3
+            if target_suffix in {".css", ".js", ".ts", ".tsx", ".jsx"} and suffix == ".html":
+                score -= 3
+            if target_suffix in {".py", ".js", ".ts", ".tsx", ".jsx"} and suffix == target_suffix:
+                score -= 2
+            if candidate.parts[:1] == ("src",):
+                score -= 1
+            scored.append((score, path))
+
+        scored.sort(key=lambda item: (item[0], item[1]))
+        return [path for _, path in scored]
+
+    @staticmethod
+    async def _report_status(progress_callback: ProgressCallback, phase: str, message: str) -> None:
+        await progress_callback(f"{phase}: {message}")
+
+    @classmethod
+    def _render_plan_message(cls, project_plan: ProjectPlan) -> str:
+        feature_lines = "\n".join(f"- {item}" for item in project_plan.features[:6]) or "- (none)"
+        file_lines = "\n".join(f"- {item['path']}" for item in project_plan.files[:20]) or "- (none)"
+        return (
+            "Plan ready.\n"
+            f"{project_plan.project_description}\n"
+            f"Features:\n{feature_lines}\n"
+            f"File tree:\n{file_lines}"
+        )
+
+    @staticmethod
+    def _render_features(features: list[str]) -> str:
+        if not features:
+            return "- (none)"
+        return "\n".join(f"- {item}" for item in features)
 
     @staticmethod
     def _strip_markdown_fences(text: str) -> str:
@@ -390,6 +714,7 @@ class BuildOrchestrator:
         stack: str,
         created_files: list[str],
         readme_content: str | None = None,
+        package_json_content: str | None = None,
     ) -> tuple[str | None, bool]:
         readme_validation = cls._pick_validation_command_from_readme(readme_content)
         if readme_validation:
@@ -401,7 +726,7 @@ class BuildOrchestrator:
         has_package_json = any(Path(path).name == "package.json" for path in created_files)
 
         if any(keyword in lowered_stack for keyword in ("node", "react", "next", "javascript", "typescript")) or has_package_json:
-            return "npm run test --if-present && npm run build --if-present", False
+            return cls._pick_node_validation_command(package_json_content), False
 
         if has_python_files:
             if any(path.startswith("tests/") for path in created_files):
@@ -410,7 +735,87 @@ class BuildOrchestrator:
                 if candidate in file_set:
                     return f"python {candidate}", False
             return "python -m compileall -q .", False
+        if any(path.lower().endswith(".html") for path in created_files):
+            entrypoint = cls._pick_static_html_entrypoint(created_files)
+            return cls._build_static_web_validation_command(entrypoint), False
         return None, False
+
+    @staticmethod
+    def _pick_static_html_entrypoint(created_files: list[str]) -> str:
+        for candidate in ("index.html", "public/index.html", "src/index.html"):
+            if candidate in created_files:
+                return candidate
+        for path in created_files:
+            if path.lower().endswith(".html"):
+                return path
+        return "index.html"
+
+    @classmethod
+    def _pick_node_validation_command(cls, package_json_content: str | None) -> str:
+        scripts = cls._extract_package_scripts(package_json_content)
+        if not scripts:
+            return "npm run build --if-present && npm run lint --if-present"
+
+        preferred_order = ("test:ci", "test", "check", "verify", "lint", "typecheck", "build")
+        selected: list[str] = []
+        for name in preferred_order:
+            script = scripts.get(name)
+            if not script:
+                continue
+            if not cls._is_meaningful_npm_script(name, script):
+                continue
+            selected.append(f"npm run {name}")
+            if len(selected) == 2:
+                break
+
+        if selected:
+            return " && ".join(selected)
+        return "npm run build --if-present && npm run lint --if-present"
+
+    @staticmethod
+    def _extract_package_scripts(package_json_content: str | None) -> dict[str, str]:
+        if not package_json_content:
+            return {}
+        try:
+            payload = json.loads(package_json_content)
+        except json.JSONDecodeError:
+            return {}
+        raw_scripts = payload.get("scripts")
+        if not isinstance(raw_scripts, dict):
+            return {}
+        scripts: dict[str, str] = {}
+        for key, value in raw_scripts.items():
+            name = str(key).strip()
+            command = str(value).strip()
+            if not name or not command:
+                continue
+            scripts[name] = command
+        return scripts
+
+    @staticmethod
+    def _is_meaningful_npm_script(name: str, script: str) -> bool:
+        lowered = script.lower()
+        if name == "test":
+            if "no test specified" in lowered:
+                return False
+            if "exit 1" in lowered and "jest" not in lowered and "vitest" not in lowered and "mocha" not in lowered:
+                return False
+        blocked = ("npm run dev", "vite", "next dev", "react-scripts start", "--watch")
+        return not any(token in lowered for token in blocked)
+
+    @staticmethod
+    def _build_static_web_validation_command(entrypoint: str) -> str:
+        safe_entrypoint = entrypoint.replace('"', "")
+        return (
+            "python -c \"from pathlib import Path;import re,sys;root=Path('.');"
+            f"html=root/'{safe_entrypoint}';"
+            "text=html.read_text(encoding='utf-8');"
+            "paths=re.findall(r'(?:href|src)=\\\"([^\\\"]+)\\\"', text);"
+            "missing=[p for p in paths if p and not p.startswith(('http://','https://','#','mailto:','javascript:')) "
+            "and not (root/p).exists()];"
+            "print('static refs ok' if not missing else 'missing refs: ' + ', '.join(missing));"
+            "sys.exit(0 if not missing else 1)\""
+        )
 
     @classmethod
     def _pick_install_command_from_readme(cls, readme_content: str | None) -> str | None:
@@ -677,16 +1082,21 @@ class BuildOrchestrator:
         )
 
     @classmethod
-    def _fallback_readme(cls, session: UserSession, created_files: list[str]) -> str:
-        install_command = cls._pick_install_command(session.stack, created_files, None)
-        validation_command, _ = cls._pick_validation_command(session.stack, created_files, None)
-        run_command = cls._pick_run_command(session.stack, created_files)
+    def _fallback_readme(
+        cls,
+        session: UserSession,
+        created_files: list[str],
+        install_command: str | None,
+        run_command: str,
+        validation_command: str | None,
+    ) -> str:
 
         install_line = install_command or "# No dependency install command inferred"
         validation_line = validation_command or "# No validation command inferred"
+        project_title = cls._fallback_project_name(session.idea)
 
         return (
-            f"# {cls._derive_project_name(session)}\n\n"
+            f"# {project_title}\n\n"
             f"Generated project for: {session.idea}\n\n"
             "## Setup\n\n"
             "```bash\n"
@@ -716,7 +1126,27 @@ class BuildOrchestrator:
             for candidate in ("main.py", "app.py", "src/main.py", "src/app.py"):
                 if candidate in file_set:
                     return f"python {candidate}"
+        if any(path.lower().endswith(".html") for path in created_files):
+            entrypoint = BuildOrchestrator._pick_static_html_entrypoint(created_files)
+            return f"open {entrypoint}"
         return "# Add your run command here"
+
+    @staticmethod
+    def _infer_entrypoint(created_files: list[str]) -> str:
+        entrypoint_candidates = (
+            "src/main.py",
+            "main.py",
+            "app.py",
+            "src/app.py",
+            "index.html",
+            "public/index.html",
+            "src/index.html",
+        )
+        file_set = set(created_files)
+        for candidate in entrypoint_candidates:
+            if candidate in file_set:
+                return candidate
+        return created_files[0] if created_files else "unknown"
 
     @staticmethod
     def _load_readme_content(project_dir: Path) -> str | None:

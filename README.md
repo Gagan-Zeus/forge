@@ -109,6 +109,9 @@ Project generation runs **only** through `/project`.
 
 - Example: `/project build a hello world html page`
 - Regular chat messages (even if they mention "project", "build", or similar terms) stay in normal Copilot chat mode.
+- The builder now runs in explicit phases with Telegram status updates: **PLAN -> BUILD -> VALIDATE -> README -> FINAL**.
+- Files are generated incrementally and written to disk immediately (not as one giant final response).
+- Validation includes auto-fix retries when checks fail.
 
 ## Troubleshooting
 

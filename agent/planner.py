@@ -3,12 +3,20 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
 from models.copilot_client import CopilotClient
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class ProjectPlan:
+    project_description: str
+    features: list[str]
+    files: list[dict[str, str]]
 
 
 class ProjectPlanner:
@@ -75,11 +83,18 @@ class ProjectPlanner:
     def __init__(self, copilot_client: CopilotClient) -> None:
         self._copilot_client = copilot_client
 
-    async def plan_files(self, idea: str, stack: str, requirements: str, model: str) -> list[dict[str, str]]:
+    async def plan_project(self, idea: str, stack: str, requirements: str, model: str) -> ProjectPlan:
         prompt = (
-            "Design a production-ready project file plan as JSON only.\n"
-            "Return exactly this schema: {\"files\":[{\"path\":\"...\",\"description\":\"...\"}]}\n"
+            "Design a production-ready project plan as JSON only.\n"
+            "Return exactly this schema:\n"
+            "{"
+            '"project_description":"...",'
+            '"features":["..."],'
+            '"files":[{"path":"...","description":"..."}]'
+            "}\n"
             "Rules:\n"
+            "- project_description must be 1-2 concise sentences.\n"
+            "- features must include 3-8 concrete, user-facing capabilities.\n"
             "- README.md is mandatory and must always be included at project root.\n"
             "- Include only files that are strictly required for a runnable project.\n"
             "- Exclude optional files unless explicitly requested: tests, docs, CI, Docker, lint configs, licenses, examples.\n"
@@ -100,6 +115,30 @@ class ProjectPlanner:
             system_prompt="You are a senior software architect. Return valid JSON only.",
         )
         payload = self._extract_json(response)
+        project_description = str(payload.get("project_description", "")).strip()
+        features = self._extract_features(payload.get("features"))
+        files = self._extract_and_trim_files(payload, stack=stack, idea=idea, requirements=requirements)
+        if not project_description:
+            project_description = f"A generated project for: {idea.strip() or 'user request'}."
+        if not features:
+            features = self._fallback_features(files)
+        return ProjectPlan(
+            project_description=project_description,
+            features=features,
+            files=files,
+        )
+
+    async def plan_files(self, idea: str, stack: str, requirements: str, model: str) -> list[dict[str, str]]:
+        return (await self.plan_project(idea=idea, stack=stack, requirements=requirements, model=model)).files
+
+    def _extract_and_trim_files(
+        self,
+        payload: dict[str, Any],
+        *,
+        stack: str,
+        idea: str,
+        requirements: str,
+    ) -> list[dict[str, str]]:
         files = payload.get("files")
         if not isinstance(files, list) or not files:
             raise ValueError("Planner returned no files.")
@@ -125,6 +164,34 @@ class ProjectPlanner:
         if len(trimmed) != len(validated):
             LOGGER.info("Planner reduced file plan from %s to %s required files.", len(validated), len(trimmed))
         return trimmed
+
+    @staticmethod
+    def _extract_features(raw_features: Any) -> list[str]:
+        if not isinstance(raw_features, list):
+            return []
+        features: list[str] = []
+        for item in raw_features:
+            feature = str(item).strip()
+            if not feature:
+                continue
+            features.append(feature)
+            if len(features) == 8:
+                break
+        return features
+
+    @staticmethod
+    def _fallback_features(files: list[dict[str, str]]) -> list[str]:
+        features: list[str] = []
+        for item in files:
+            description = str(item.get("description", "")).strip()
+            if not description:
+                continue
+            features.append(description[0].upper() + description[1:] if len(description) > 1 else description.upper())
+            if len(features) == 5:
+                break
+        if features:
+            return features
+        return ["Core project scaffolding", "Runnable entry point", "Basic documentation"]
 
     @staticmethod
     def _extract_json(raw_text: str) -> dict[str, Any]:
