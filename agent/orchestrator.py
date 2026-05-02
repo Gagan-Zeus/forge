@@ -74,7 +74,7 @@ class BuildOrchestrator:
         created_files: list[str] = []
         generated_contents: dict[str, str] = {}
         warnings: list[str] = []
-        validation_status = "not run"
+        validation_status = "not run (skipped by /project)"
 
         try:
             await self._report_status(progress_callback, "PLAN", "Creating project plan...")
@@ -118,97 +118,8 @@ class BuildOrchestrator:
                 generated_contents[relative_path] = content
                 await self._report_status(progress_callback, "BUILD", f"Created {relative_path}")
 
-            install_command = self._pick_install_command(session.stack, created_files, None)
-            if install_command:
-                await self._raise_if_cancelled(cancel_event)
-                await self._report_status(progress_callback, "VALIDATE", f"Running dependency install: {install_command}")
-                install_result = await self._shell_runner.run(install_command, project_dir)
-                if not install_result["success"]:
-                    warnings.append(self._format_command_warning("dependency install", install_result))
-                    await self._report_status(
-                        progress_callback,
-                        "VALIDATE",
-                        "Dependency install failed; continuing with best-effort validation.",
-                    )
-                else:
-                    await self._report_status(progress_callback, "VALIDATE", "Dependency install completed.")
-
-            validation_command, _ = self._pick_validation_command(
-                session.stack,
-                created_files,
-                None,
-                package_json_content=generated_contents.get("package.json"),
-            )
-            if validation_command:
-                await self._report_status(progress_callback, "VALIDATE", "Running validation checks...")
-                validation_result = {}
-                for attempt in range(1, self.MAX_FIX_ATTEMPTS + 1):
-                    await self._raise_if_cancelled(cancel_event)
-                    command_label = (
-                        validation_command if len(validation_command) <= 180 else validation_command[:180] + "..."
-                    )
-                    await self._report_status(
-                        progress_callback,
-                        "VALIDATE",
-                        f"Validation attempt {attempt}/{self.MAX_FIX_ATTEMPTS}: {command_label}",
-                    )
-                    validation_result = await self._shell_runner.run(validation_command, project_dir)
-                    if validation_result["success"]:
-                        validation_status = "passed"
-                        await self._report_status(progress_callback, "VALIDATE", "Validation passed.")
-                        break
-
-                    validation_error = self._combine_output(validation_result)
-                    validation_status = "failed"
-                    await self._report_status(
-                        progress_callback,
-                        "VALIDATE",
-                        f"Validation failed: {self._summarize_issue(validation_error)}",
-                    )
-                    if attempt >= self.MAX_FIX_ATTEMPTS:
-                        return BuildResult(
-                            success=False,
-                            project_name=project_name,
-                            project_path=str(project_dir),
-                            files_created=created_files,
-                            warnings=warnings,
-                            error=(
-                                "Validation failed after auto-fix attempts. "
-                                f"Issue: {self._summarize_issue(validation_error)}\n"
-                                f"Details:\n{validation_error[:2500]}"
-                            ),
-                        )
-
-                    fixed_files = await self._fix_files_from_validation_error(
-                        session=session,
-                        project_plan=project_plan,
-                        error_text=validation_error,
-                        created_files=created_files,
-                        generated_contents=generated_contents,
-                        project_dir=project_dir,
-                        progress_callback=progress_callback,
-                    )
-                    if not fixed_files:
-                        return BuildResult(
-                            success=False,
-                            project_name=project_name,
-                            project_path=str(project_dir),
-                            files_created=created_files,
-                            warnings=warnings,
-                            error=(
-                                "Validation failed and no safe fix candidates were identified. "
-                                f"Issue: {self._summarize_issue(validation_error)}\n"
-                                f"Details:\n{validation_error[:2500]}"
-                            ),
-                        )
-            else:
-                warnings.append("Validation skipped because no command could be inferred from the stack.")
-                validation_status = "skipped"
-                await self._report_status(
-                    progress_callback,
-                    "VALIDATE",
-                    "Validation skipped (no suitable command inferred for this project type).",
-                )
+            install_command: str | None = None
+            validation_command: str | None = None
 
             await self._raise_if_cancelled(cancel_event)
             await self._report_status(progress_callback, "README", "Generating README.md from actual project outputs...")
@@ -260,8 +171,7 @@ class BuildOrchestrator:
                     "Project ready.\n"
                     f"Name: {project_name}\n"
                     f"Entry point: {entrypoint}\n"
-                    f"Run: {run_hint}\n"
-                    f"Validation: {validation_status}"
+                    f"Run: {run_hint}"
                 ),
             )
 

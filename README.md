@@ -109,9 +109,9 @@ Project generation runs **only** through `/project`.
 
 - Example: `/project build a hello world html page`
 - Regular chat messages (even if they mention "project", "build", or similar terms) stay in normal Copilot chat mode.
-- The builder now runs in explicit phases with Telegram status updates: **PLAN -> BUILD -> VALIDATE -> README -> FINAL**.
+- The builder now runs in explicit phases with Telegram status updates: **PLAN -> BUILD -> README -> FINAL**.
 - Files are generated incrementally and written to disk immediately (not as one giant final response).
-- Validation includes auto-fix retries when checks fail.
+- `/project` focuses on project creation and does not run post-generation tests/validation.
 
 ## Troubleshooting
 
@@ -125,7 +125,7 @@ Project generation runs **only** through `/project`.
 
 - Use `/status` to inspect progress.
 - Review the error summary sent by the bot.
-- If generated code still fails after retries, refine requirements and restart the chat with `/reset`.
+- If generated code needs fixes, refine requirements and restart the chat with `/reset`.
 - If a specific model fails, switch model with `/model` and retry.
 
 ### GitHub push failed
