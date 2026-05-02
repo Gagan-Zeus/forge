@@ -19,6 +19,12 @@ class ProjectPlan:
     files: list[dict[str, str]]
 
 
+@dataclass
+class UpdatePlan:
+    reasoning: str
+    files_to_update: list[dict[str, str]]
+
+
 class ProjectPlanner:
     MIN_FILE_COUNT = 4
     DEFAULT_MAX_FILES = 10
@@ -127,6 +133,57 @@ class ProjectPlanner:
             features=features,
             files=files,
         )
+
+    async def plan_updates(
+        self,
+        update_prompt: str,
+        project_context: str,
+        file_tree: str,
+        model: str,
+    ) -> UpdatePlan:
+        prompt = (
+            "Plan the necessary file updates for the existing project based on the user's request.\n"
+            "Return exactly this JSON schema:\n"
+            "{\n"
+            '  "reasoning": "Brief explanation of what changes are needed.",\n'
+            '  "files_to_update": [\n'
+            '    {"path": "...", "description": "What to change in this file or why it is being created."}\n'
+            "  ]\n"
+            "}\n\n"
+            "Rules:\n"
+            "- Include ONLY files that need to be changed or newly created.\n"
+            "- If a file exists, its path must match exactly as shown in the file tree.\n"
+            "- Do not include files that don't need changes.\n"
+            "- Use forward-slash paths.\n"
+            "- Keep descriptions technical and concise.\n\n"
+            f"User update request: {update_prompt}\n\n"
+            f"Project Context:\n{project_context}\n\n"
+            f"Current File Tree:\n{file_tree}\n"
+        )
+        response = await self._copilot_client.call(
+            messages=[{"role": "user", "content": prompt}],
+            model=model,
+            system_prompt="You are a senior software architect planning a code update. Return valid JSON only.",
+        )
+        payload = self._extract_json(response)
+        reasoning = str(payload.get("reasoning", "Updating project files.")).strip()
+        files = payload.get("files_to_update", [])
+        if not isinstance(files, list):
+            files = []
+
+        validated: list[dict[str, str]] = []
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path", "")).strip()
+            description = str(item.get("description", "")).strip()
+            if not path or not description:
+                continue
+            if not self._is_safe_relative_path(path):
+                continue
+            validated.append({"path": path, "description": description})
+
+        return UpdatePlan(reasoning=reasoning, files_to_update=validated)
 
     async def plan_files(self, idea: str, stack: str, requirements: str, model: str) -> list[dict[str, str]]:
         return (await self.plan_project(idea=idea, stack=stack, requirements=requirements, model=model)).files
