@@ -440,16 +440,17 @@ async def github_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _safe_send_message(context.application, chat_id, "No active project found. Use /project or /create first.")
         return
 
-    args = context.args or []
+    # Normalize dashes: em-dash (—) and en-dash (–) to standard dashes
+    args = [a.replace("—", "--").replace("–", "-") for a in (context.args or [])]
     repo_name = ""
     branch = "main"
 
     i = 0
     while i < len(args):
-        if args[i] == "--branch" and i + 1 < len(args):
+        if args[i] in ("--branch", "-b") and i + 1 < len(args):
             branch = args[i+1]
             i += 2
-        elif args[i].startswith("--"):
+        elif args[i].startswith("-"):
             i += 1
         else:
             if not repo_name:
