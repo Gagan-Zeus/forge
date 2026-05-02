@@ -187,6 +187,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("project", project_command))
+    app.add_handler(CommandHandler("update", update_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("status", status_command))
@@ -224,6 +225,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "Commands:\n"
                 "/model - change model\n"
                 "/project <prompt> - build a project from prompt\n"
+                "/update <prompt> - update the active project\n"
                 "/status - show current state\n"
                 "/cancel - cancel running build\n"
                 "/reset - reset chat state"
@@ -354,6 +356,60 @@ async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         session,
         project_prompt,
     )
+
+
+async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = _chat_id(update)
+    if chat_id is None:
+        return
+
+    services = _services(context)
+    session = services.sessions.get(chat_id)
+
+    if not session.is_authenticated:
+        await _safe_send_message(context.application, chat_id, "Use /start first to initialize Copilot SDK.")
+        return
+
+    if session.is_building:
+        await _safe_send_message(context.application, chat_id, "A task is already running. Use /status to check progress.")
+        return
+
+    if not session.active_project_path:
+        await _safe_send_message(context.application, chat_id, "No active project found. Use /project first to generate one.")
+        return
+
+    update_prompt = " ".join(context.args or []).strip()
+    if not update_prompt:
+        await _safe_send_message(context.application, chat_id, "Usage: /update <changes to make>\nExample: /update add a login page")
+        return
+
+    session.is_building = True
+    session.build_progress = "Initializing update..."
+
+    async def _progress_update(message: str) -> None:
+        session.build_progress = message
+        await _safe_send_message(context.application, chat_id, message)
+
+    try:
+        result = await services.orchestrator.update_project(
+            chat_id=chat_id,
+            session=session,
+            update_prompt=update_prompt,
+            progress_callback=_progress_update,
+        )
+    finally:
+        session.is_building = False
+
+    if result.success:
+        changed = result.files_created
+        msg = f"Update completed successfully.\nFiles changed: {len(changed)}"
+        if changed:
+            msg += "\n\nChanges:\n" + "\n".join(f"- {f}" for f in changed[:20])
+            if len(changed) > 20:
+                msg += f"\n... and {len(changed) - 20} more."
+        await _safe_send_message(context.application, chat_id, msg)
+    else:
+        await _safe_send_message(context.application, chat_id, f"Update failed: {result.error}")
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -552,7 +608,7 @@ async def _handle_workspace_chat(
         await _safe_send_message(application, chat_id, f"Copilot request failed: {exc}")
         return
     except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("Workspace chatbot request failed for chat_id=%s", chat_id)
+        LOGGER.exception("Workspace chatbot request failed for chat_id=%s")
         await _safe_send_message(application, chat_id, f"Workspace chat failed: {exc}")
         return
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -213,6 +214,245 @@ class BuildOrchestrator:
             )
         finally:
             self._cancel_events.pop(chat_id, None)
+
+    async def update_project(
+        self,
+        chat_id: int,
+        session: UserSession,
+        update_prompt: str,
+        progress_callback: ProgressCallback,
+    ) -> BuildResult:
+        cancel_event = asyncio.Event()
+        self._cancel_events[chat_id] = cancel_event
+
+        if not session.active_project_path:
+            return BuildResult(
+                success=False,
+                project_name="unknown",
+                project_path="unknown",
+                error="No active project set in session. Use /project first.",
+            )
+
+        project_path = Path(session.active_project_path)
+        if not project_path.exists():
+            return BuildResult(
+                success=False,
+                project_name=project_path.name,
+                project_path=str(project_path),
+                error="Active project path does not exist.",
+            )
+
+        project_name = project_path.name
+        changed_files: list[str] = []
+        generated_contents: dict[str, str] = {}
+        warnings: list[str] = []
+
+        try:
+            await self._report_status(progress_callback, "SCAN", "Scanning existing project...")
+            file_tree = self._render_file_tree(project_path)
+            project_context = session.project_context
+
+            await self._report_status(progress_callback, "PLAN", "Planning updates...")
+            update_plan = await self._planner.plan_updates(
+                update_prompt=update_prompt,
+                project_context=project_context,
+                file_tree=file_tree,
+                model=session.model,
+            )
+            await self._raise_if_cancelled(cancel_event)
+            await self._report_status(progress_callback, "PLAN", f"Update plan: {update_plan.reasoning}")
+
+            if not update_plan.files_to_update:
+                await self._report_status(progress_callback, "FINAL", "No files need updating.")
+                return BuildResult(
+                    success=True,
+                    project_name=project_name,
+                    project_path=str(project_path),
+                )
+
+            await self._report_status(
+                progress_callback,
+                "UPDATE",
+                f"Applying updates to {len(update_plan.files_to_update)} files...",
+            )
+
+            existing_contents = await self._read_all_files(project_path)
+            generated_contents.update(existing_contents)
+
+            for index, file_item in enumerate(update_plan.files_to_update, start=1):
+                await self._raise_if_cancelled(cancel_event)
+                relative_path = file_item["path"]
+                description = file_item["description"]
+                
+                await self._report_status(
+                    progress_callback,
+                    "UPDATE",
+                    f"Updating {relative_path} ({index}/{len(update_plan.files_to_update)})",
+                )
+
+                current_content = existing_contents.get(relative_path, "")
+                content = await self._generate_updated_file_content(
+                    session=session,
+                    file_path=relative_path,
+                    file_description=description,
+                    current_content=current_content,
+                    generated_contents=generated_contents,
+                    update_prompt=update_prompt,
+                )
+
+                content, dependency_warnings = await self._dependency_version_resolver.refresh_for_file(
+                    relative_path,
+                    content,
+                )
+                if dependency_warnings:
+                    warnings.extend(dependency_warnings)
+
+                await self._file_writer.write_file(project_path, relative_path, content)
+                changed_files.append(relative_path)
+                generated_contents[relative_path] = content
+                await self._report_status(progress_callback, "UPDATE", f"Modified {relative_path}")
+
+            # Update README
+            await self._raise_if_cancelled(cancel_event)
+            await self._report_status(progress_callback, "README", "Updating README.md...")
+            all_files = sorted(list(generated_contents.keys()))
+            readme_content = await self._generate_readme_content(
+                session=session,
+                project_plan=ProjectPlan(
+                    project_description=f"Updated: {update_prompt}",
+                    features=[],
+                    files=[{"path": p, "description": ""} for p in all_files]
+                ),
+                created_files=all_files,
+                generated_contents=generated_contents,
+                install_command=self._pick_install_command(session.stack, all_files),
+                run_command=self._pick_run_command(session.stack, all_files),
+                validation_command=None,
+                validation_status="updated",
+            )
+            await self._file_writer.write_file(project_path, "README.md", readme_content)
+            if "README.md" not in changed_files:
+                changed_files.append("README.md")
+
+            # Push to GitHub
+            github_url: str | None = session.active_github_url
+            if session.push_to_github:
+                if not self._github_pusher:
+                    warnings.append("GitHub push skipped: pusher is not configured.")
+                else:
+                    await self._raise_if_cancelled(cancel_event)
+                    await self._report_status(progress_callback, "FINAL", "Pushing updates to GitHub...")
+                    github_url = await self._github_pusher.push_project(
+                        project_path=project_path,
+                        repo_name=session.repo_name or project_name,
+                        visibility=session.repo_visibility,
+                    )
+                    await self._report_status(progress_callback, "FINAL", f"GitHub push complete: {github_url}")
+
+            await self._report_status(
+                progress_callback,
+                "FINAL",
+                f"Update complete. {len(changed_files)} files changed.",
+            )
+
+            return BuildResult(
+                success=True,
+                project_name=project_name,
+                project_path=str(project_path),
+                files_created=changed_files,
+                warnings=warnings,
+                github_url=github_url,
+            )
+
+        except BuildCancelledError:
+            return BuildResult(
+                success=False,
+                project_name=project_name,
+                project_path=str(project_path),
+                error="Update canceled by user.",
+            )
+        except Exception as exc:
+            LOGGER.exception("Update failed for chat_id=%s", chat_id)
+            return BuildResult(
+                success=False,
+                project_name=project_name,
+                project_path=str(project_path),
+                error=str(exc),
+            )
+        finally:
+            self._cancel_events.pop(chat_id, None)
+
+    async def _generate_updated_file_content(
+        self,
+        session: UserSession,
+        file_path: str,
+        file_description: str,
+        current_content: str,
+        generated_contents: dict[str, str],
+        update_prompt: str,
+    ) -> str:
+        related_context = self._render_related_file_context(
+            target_path=file_path,
+            plan_files=[{"path": k, "description": ""} for k in generated_contents],
+            generated_contents=generated_contents,
+        )
+        
+        prompt = (
+            "Update the requested file based on the user's prompt.\n"
+            "Return only the full new file content without markdown fences.\n"
+            "Maintain consistency with the rest of the project.\n\n"
+            f"User update request: {update_prompt}\n"
+            f"Target file: {file_path}\n"
+            f"Target purpose: {file_description}\n\n"
+        )
+        
+        if current_content:
+            prompt += f"Current content of {file_path}:\n```\n{current_content}\n```\n\n"
+        else:
+            prompt += f"Note: This is a NEW file being added to the project.\n\n"
+
+        prompt += f"Previously written/relevant files for context:\n{related_context}\n"
+
+        response = await self._copilot_client.call(
+            messages=[{"role": "user", "content": prompt}],
+            model=session.model,
+            system_prompt="You are a senior software engineer updating production code. Return only the code.",
+        )
+        return self._strip_markdown_fences(response)
+
+    def _render_file_tree(self, project_path: Path) -> str:
+        lines = []
+        excluded_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv"}
+        for root, dirs, files in os.walk(project_path):
+            dirs[:] = [d for d in dirs if d not in excluded_dirs]
+            rel_root = os.path.relpath(root, project_path)
+            if rel_root == ".":
+                depth = 0
+            else:
+                depth = rel_root.count(os.sep) + 1
+            
+            indent = "  " * depth
+            if rel_root != ".":
+                lines.append(f"{indent}{os.path.basename(root)}/")
+            
+            file_indent = "  " * (depth + 1)
+            for f in files:
+                lines.append(f"{file_indent}{f}")
+        
+        return "\n".join(lines)
+
+    async def _read_all_files(self, project_path: Path) -> dict[str, str]:
+        contents = {}
+        excluded_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv"}
+        for root, dirs, files in os.walk(project_path):
+            dirs[:] = [d for d in dirs if d not in excluded_dirs]
+            for f in files:
+                rel_path = os.path.relpath(os.path.join(root, f), project_path)
+                try:
+                    contents[rel_path] = await self._file_writer.read_file(project_path, rel_path)
+                except Exception:
+                    continue
+        return contents
 
     async def _generate_file_content(
         self,
