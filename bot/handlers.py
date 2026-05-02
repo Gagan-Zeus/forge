@@ -188,6 +188,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("create", create_command))
     app.add_handler(CommandHandler("project", project_command))
+    app.add_handler(CommandHandler("github", github_command))
     app.add_handler(CommandHandler("update", update_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("reset", reset_command))
@@ -228,6 +229,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "/model - change model\n"
                 "/create <prompt> - build a new project\n"
                 "/project - select an existing project\n"
+                "/github <repo_name> [--branch <branch>] - push to GitHub\n"
                 "/update <prompt> - update the active project\n"
                 "/status - show current state\n"
                 "/cancel - cancel running build\n"
@@ -420,6 +422,67 @@ async def project_selection_callback(update: Update, context: ContextTypes.DEFAU
         chat_id,
         f"Active project set to: {project_name}\nYou can now use /update to make changes.",
     )
+
+
+async def github_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = _chat_id(update)
+    if chat_id is None:
+        return
+
+    services = _services(context)
+    session = services.sessions.get(chat_id)
+
+    if not session.is_authenticated:
+        await _safe_send_message(context.application, chat_id, "Use /start first to initialize Copilot SDK.")
+        return
+
+    if not session.active_project_path:
+        await _safe_send_message(context.application, chat_id, "No active project found. Use /project or /create first.")
+        return
+
+    args = context.args or []
+    repo_name = ""
+    branch = "main"
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--branch" and i + 1 < len(args):
+            branch = args[i+1]
+            i += 2
+        elif args[i].startswith("--"):
+            i += 1
+        else:
+            if not repo_name:
+                repo_name = args[i]
+            i += 1
+
+    if not repo_name:
+        repo_name = session.repo_name
+
+    if not repo_name:
+        project_path = Path(session.active_project_path)
+        repo_name = _derive_repo_name(project_path)
+    
+    session.repo_name = repo_name
+
+    await _safe_send_message(context.application, chat_id, f"Pushing project to GitHub repository '{repo_name}' on branch '{branch}'...")
+
+    try:
+        if not services.github_pusher:
+             await _safe_send_message(context.application, chat_id, "GitHub pusher not configured.")
+             return
+             
+        github_url = await services.github_pusher.push_project(
+            project_path=Path(session.active_project_path),
+            repo_name=repo_name,
+            visibility=session.repo_visibility,
+            branch=branch
+        )
+        session.active_github_url = github_url
+        await _safe_send_message(context.application, chat_id, f"Project successfully pushed to GitHub: {github_url}")
+    except Exception as exc:
+        LOGGER.exception("GitHub push failed for chat_id=%s", chat_id)
+        await _safe_send_message(context.application, chat_id, f"GitHub push failed: {exc}")
 
 
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -33,7 +33,7 @@ class GitHubPusher:
         self._access_token_provider = access_token_provider
         self._shell_runner = shell_runner
 
-    async def push_project(self, project_path: Path, repo_name: str, visibility: str) -> str:
+    async def push_project(self, project_path: Path, repo_name: str, visibility: str, branch: str = "main") -> str:
         access_token = await self._access_token_provider()
         repo = await asyncio.to_thread(self._create_or_get_repo, access_token, repo_name, visibility)
         remote_url = f"https://x-access-token:{access_token}@github.com/{repo.full_name}.git"
@@ -48,10 +48,10 @@ class GitHubPusher:
         if not commit_result["success"] and "nothing to commit" not in combined_commit_output:
             self._raise_git_error("git commit", commit_result, access_token)
 
-        await self._run_or_raise("git branch -M main", project_path, access_token)
+        await self._run_or_raise(f"git branch -M {branch}", project_path, access_token)
         await self._shell_runner.run("git remote remove origin", project_path)
         await self._run_or_raise(f"git remote add origin '{remote_url}'", project_path, access_token)
-        await self._run_or_raise("git push -u origin main", project_path, access_token)
+        await self._run_or_raise(f"git push -u origin {branch}", project_path, access_token)
         return repo.html_url
 
     def _create_or_get_repo(self, access_token: str, repo_name: str, visibility: str) -> RepositoryInfo:

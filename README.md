@@ -115,6 +115,23 @@ Project generation runs **only** through `/create`.
 - `/create` focuses on project creation and does not run post-generation tests/validation.
 - Dependency manifests (`requirements.txt`, `package.json`) are refreshed to current registry versions during generation.
 
+## GitHub Push Command
+
+The `/github` command allows you to push the active project to a GitHub repository.
+
+- Usage: `/github <repo_name> [--branch <branch_name>]`
+- Example: `/github my-awesome-project --branch develop`
+- If no branch is specified, it defaults to `main`.
+- The repository name is required for the first push; subsequent pushes to the same repo will use the saved name if not provided.
+
+## Project Selection Command
+
+The `/project` command allows you to select an existing project from your directory.
+
+- Usage: `/project`
+- Telegram will display inline buttons for each project directory found in your `PROJECTS_DIR`.
+- Selecting a project sets it as active, allowing you to use `/update` or `/github` immediately.
+
 ## Troubleshooting
 
 ### Copilot authentication issues
