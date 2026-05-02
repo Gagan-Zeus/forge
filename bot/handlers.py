@@ -190,6 +190,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     app.add_handler(CommandHandler("project", project_command))
     app.add_handler(CommandHandler("github", github_command))
     app.add_handler(CommandHandler("update", update_command))
+    app.add_handler(CommandHandler("delete", delete_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("status", status_command))
@@ -231,6 +232,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "/project - select an existing project\n"
                 "/github <repo_name> [--branch <branch>] - push to GitHub\n"
                 "/update <prompt> - update the active project\n"
+                "/delete - delete the active project directory\n"
                 "/status - show current state\n"
                 "/cancel - cancel running build\n"
                 "/reset - reset chat state"
@@ -538,6 +540,57 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _safe_send_message(context.application, chat_id, msg)
     else:
         await _safe_send_message(context.application, chat_id, f"Update failed: {result.error}")
+
+
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = _chat_id(update)
+    if chat_id is None:
+        return
+
+    services = _services(context)
+    session = services.sessions.get(chat_id)
+
+    if not session.is_authenticated:
+        await _safe_send_message(context.application, chat_id, "Use /start first to initialize Copilot SDK.")
+        return
+
+    if not session.active_project_path:
+        await _safe_send_message(context.application, chat_id, "No active project found. Use /project to select one or /create to generate a new one.")
+        return
+
+    project_path = Path(session.active_project_path)
+    projects_root = _projects_root(context.application)
+
+    # Ensure the project path is within the projects_root for safety
+    try:
+        project_path.relative_to(projects_root.resolve())
+    except ValueError:
+        await _safe_send_message(context.application, chat_id, f"Project path '{project_path}' is outside the projects directory. Deletion aborted.")
+        return
+
+    if not project_path.exists():
+        await _safe_send_message(context.application, chat_id, f"Project path '{project_path}' does not exist.")
+        session.active_project_path = ""
+        session.active_github_url = ""
+        return
+
+    # Delete the project directory
+    try:
+        import shutil
+        shutil.rmtree(project_path)
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            f"Project '{project_path.name}' has been deleted successfully."
+        )
+        # Clear the active project from session
+        session.active_project_path = ""
+        session.active_github_url = ""
+        session.repo_name = ""
+        session.project_context = ""
+    except Exception as exc:
+        LOGGER.exception("Failed to delete project for chat_id=%s", chat_id)
+        await _safe_send_message(context.application, chat_id, f"Failed to delete project: {exc}")
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
