@@ -149,6 +149,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     copilot_client = CopilotClient(
         cli_path=os.getenv("COPILOT_CLI_PATH", ""),
         github_token=github_pat,
+        base_system_prompt_path=os.getenv("SYSTEM_PROMPT_PATH", ""),
     )
     planner = ProjectPlanner(copilot_client)
 

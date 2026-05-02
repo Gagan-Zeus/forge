@@ -5,6 +5,7 @@ import logging
 import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 from copilot import CopilotClient as SDKCopilotClient
@@ -43,14 +44,46 @@ class CopilotClient:
         timeout_seconds: float | None = None,
         cli_path: str | None = None,
         github_token: str | None = None,
+        base_system_prompt_path: str | None = None,
     ) -> None:
         self._timeout_seconds = timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
         self._cli_path = (cli_path or os.getenv("COPILOT_CLI_PATH", "")).strip() or None
         self._github_token = (github_token or "").strip()
+        self._base_system_prompt = self._load_base_system_prompt(base_system_prompt_path)
 
         self._sdk_client: SDKCopilotClient | None = None
         self._client_lock = asyncio.Lock()
         self._model_refresh_warning_emitted = False
+
+    @staticmethod
+    def _resolve_base_system_prompt_path(base_system_prompt_path: str | None) -> Path:
+        if base_system_prompt_path:
+            return Path(base_system_prompt_path).expanduser().resolve()
+        return (Path(__file__).resolve().parent.parent / "system-prompt.txt").resolve()
+
+    @classmethod
+    def _load_base_system_prompt(cls, base_system_prompt_path: str | None) -> str:
+        candidate = cls._resolve_base_system_prompt_path(base_system_prompt_path)
+        if not candidate.exists() or not candidate.is_file():
+            LOGGER.info("Base system prompt file not found at %s; continuing without it.", candidate)
+            return ""
+        try:
+            content = candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            LOGGER.warning("Could not read base system prompt file at %s; continuing without it.", candidate)
+            return ""
+        return content
+
+    def _merged_system_prompt(self, system_prompt: str | None) -> str | None:
+        base = self._base_system_prompt.strip()
+        scoped = (system_prompt or "").strip()
+        if base and scoped:
+            return f"{base}\n\n{scoped}"
+        if base:
+            return base
+        if scoped:
+            return scoped
+        return None
 
     def is_authenticated(self) -> bool:
         return self._sdk_client is not None and self._sdk_client.get_state() == "connected"
@@ -194,10 +227,11 @@ class CopilotClient:
                     "model": model,
                     "streaming": on_assistant_delta is not None,
                 }
-                if system_prompt:
+                merged_system_prompt = self._merged_system_prompt(system_prompt)
+                if merged_system_prompt:
                     session_kwargs["system_message"] = {
                         "mode": "append",
-                        "content": system_prompt,
+                        "content": merged_system_prompt,
                     }
 
                 session = await sdk_client.create_session(**session_kwargs)
