@@ -11,6 +11,7 @@ from typing import Awaitable, Callable
 from agent.planner import ProjectPlan, ProjectPlanner
 from bot.session import UserSession
 from models.copilot_client import CopilotClient
+from tools.dependency_version_resolver import DependencyVersionResolver
 from tools.file_writer import FileWriter
 from tools.github_pusher import GitHubPusher
 from tools.shell_runner import ShellRunner
@@ -47,12 +48,14 @@ class BuildOrchestrator:
         file_writer: FileWriter,
         shell_runner: ShellRunner,
         github_pusher: GitHubPusher | None = None,
+        dependency_version_resolver: DependencyVersionResolver | None = None,
     ) -> None:
         self._copilot_client = copilot_client
         self._planner = planner
         self._file_writer = file_writer
         self._shell_runner = shell_runner
         self._github_pusher = github_pusher
+        self._dependency_version_resolver = dependency_version_resolver or DependencyVersionResolver()
         self._cancel_events: dict[int, asyncio.Event] = {}
 
     def cancel(self, chat_id: int) -> None:
@@ -113,6 +116,12 @@ class BuildOrchestrator:
                     file_description=description,
                     generated_contents=generated_contents,
                 )
+                content, dependency_warnings = await self._dependency_version_resolver.refresh_for_file(
+                    relative_path,
+                    content,
+                )
+                if dependency_warnings:
+                    warnings.extend(dependency_warnings)
                 await self._file_writer.write_file(project_dir, relative_path, content)
                 created_files.append(relative_path)
                 generated_contents[relative_path] = content

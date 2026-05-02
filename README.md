@@ -112,6 +112,7 @@ Project generation runs **only** through `/project`.
 - The builder now runs in explicit phases with Telegram status updates: **PLAN -> BUILD -> README -> FINAL**.
 - Files are generated incrementally and written to disk immediately (not as one giant final response).
 - `/project` focuses on project creation and does not run post-generation tests/validation.
+- Dependency manifests (`requirements.txt`, `package.json`) are refreshed to current registry versions during generation.
 
 ## Troubleshooting
 
