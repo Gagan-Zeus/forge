@@ -190,6 +190,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     app.add_handler(CommandHandler("project", project_command))
     app.add_handler(CommandHandler("github", github_command))
     app.add_handler(CommandHandler("update", update_command))
+    app.add_handler(CommandHandler("install", install_command))
     app.add_handler(CommandHandler("delete", delete_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("reset", reset_command))
@@ -233,6 +234,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "/github <repo_name> [--branch <branch>] - push to GitHub\n"
                 "/update <prompt> - update the active project\n"
                 "/delete - delete the active project directory\n"
+                "/install - install project dependencies\n"
                 "/status - show current state\n"
                 "/cancel - cancel running build\n"
                 "/reset - reset chat state"
@@ -612,6 +614,751 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         chat_id,
         "Cancellation requested. I will stop after the current active step.",
     )
+
+
+async def install_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = _chat_id(update)
+    if chat_id is None:
+        return
+
+    services = _services(context)
+    session = services.sessions.get(chat_id)
+
+    if not session.is_authenticated:
+        await _safe_send_message(context.application, chat_id, "Use /start first to initialize Copilot SDK.")
+        return
+
+    if not session.active_project_path:
+        await _safe_send_message(context.application, chat_id, "No active project found. Use /project to select one or /create to generate a new one.")
+        return
+
+    project_path = Path(session.active_project_path)
+
+    if not project_path.exists():
+        await _safe_send_message(context.application, chat_id, f"Project path does not exist: {project_path}")
+        return
+
+    # Detect project type and determine install command
+    await _safe_send_message(context.application, chat_id, "Analyzing project structure and installing dependencies...")
+
+    install_result = await _analyze_and_install_dependencies(services, project_path, session)
+
+    if install_result["success"]:
+        msg = f"✅ Dependencies installed successfully!\n\n{install_result['message']}"
+        if install_result.get("fixes_applied"):
+            msg += f"\n\n🔧 Fixes applied:\n" + "\n".join(f"• {fix}" for fix in install_result["fixes_applied"])
+        if install_result.get("commands_executed"):
+            msg += f"\n\nCommands executed:\n" + "\n".join(f"• {cmd}" for cmd in install_result["commands_executed"])
+        await _safe_send_message(context.application, chat_id, msg)
+    else:
+        msg = f"❌ Installation failed:\n\n{install_result['message']}"
+        if install_result.get("fixes_applied"):
+            msg += f"\n\n🔧 Attempted fixes:\n" + "\n".join(f"• {fix}" for fix in install_result["fixes_applied"])
+        await _safe_send_message(context.application, chat_id, msg)
+
+
+async def _analyze_and_install_dependencies(
+    services: RuntimeServices,
+    project_path: Path,
+    session: UserSession,
+) -> dict[str, Any]:
+    """Analyze project, install dependencies, and fix issues if installation fails."""
+    results = []
+    commands_executed = []
+    fixes_applied = []
+
+    # Detect virtual environment
+    venv_path, venv_python = _detect_virtual_env(project_path)
+
+    # Check for various dependency files
+    dependency_files = {
+        "package.json": {
+            "name": "Node.js/npm",
+            "commands": ["npm install"],
+            "lock_files": ["package-lock.json", "yarn.lock", "pnpm-lock.yaml"],
+            "fixable": True,
+        },
+        "requirements.txt": {
+            "name": "Python pip",
+            "commands": _build_python_commands(venv_python, "-m pip install -r requirements.txt"),
+            "lock_files": [],
+            "fixable": True,
+            "venv_required": True,
+        },
+        "pyproject.toml": {
+            "name": "Python (Poetry/PDM/uv)",
+            "commands": _get_pyproject_commands(project_path, venv_python),
+            "lock_files": ["poetry.lock", "pdm.lock", "uv.lock"],
+            "fixable": True,
+            "venv_required": True,
+        },
+        "setup.py": {
+            "name": "Python setuptools",
+            "commands": _build_python_commands(venv_python, "-m pip install -e ."),
+            "lock_files": [],
+            "fixable": True,
+            "venv_required": True,
+        },
+        "Pipfile": {
+            "name": "Python pipenv",
+            "commands": ["pipenv install"],
+            "lock_files": ["Pipfile.lock"],
+            "fixable": False,
+            "venv_required": True,
+        },
+        "Cargo.toml": {
+            "name": "Rust Cargo",
+            "commands": ["cargo build"],
+            "lock_files": ["Cargo.lock"],
+            "fixable": False,
+        },
+        "go.mod": {
+            "name": "Go modules",
+            "commands": ["go mod download", "go mod tidy"],
+            "lock_files": ["go.sum"],
+            "fixable": True,
+        },
+        "Gemfile": {
+            "name": "Ruby Bundler",
+            "commands": ["bundle install"],
+            "lock_files": ["Gemfile.lock"],
+            "fixable": False,
+        },
+        "composer.json": {
+            "name": "PHP Composer",
+            "commands": ["composer install"],
+            "lock_files": ["composer.lock"],
+            "fixable": False,
+        },
+        "pom.xml": {
+            "name": "Java Maven",
+            "commands": ["mvn install -DskipTests"],
+            "lock_files": [],
+            "fixable": False,
+        },
+        "build.gradle": {
+            "name": "Java Gradle",
+            "commands": ["gradle build -x test"],
+            "lock_files": [],
+            "fixable": False,
+        },
+        # Additional lock files for reference
+        "uv.lock": {
+            "name": "Python uv (lock file)",
+            "commands": ["uv sync", "uv pip install -r pyproject.toml"],
+            "lock_files": [],
+            "fixable": True,
+            "venv_required": True,
+        },
+    }
+
+    found_dependencies = []
+
+    # Scan for dependency files
+    for filename, config in dependency_files.items():
+        file_path = project_path / filename
+        if file_path.exists():
+            found_dependencies.append((filename, config))
+
+    if not found_dependencies:
+        return {
+            "success": True,
+            "message": "No dependency files found in the project. The project may not require dependency installation.",
+            "commands_executed": [],
+            "fixes_applied": [],
+        }
+
+    # Install dependencies for each detected type
+    for filename, config in found_dependencies:
+        LOGGER.info("Installing dependencies for %s project (file: %s)", config["name"], filename)
+
+        # For Python projects, ensure virtual environment exists
+        if config.get("venv_required", False):
+            venv_path, venv_python = _detect_virtual_env(project_path)
+            if not venv_path:
+                LOGGER.info("No virtual environment found for Python project, creating one...")
+                venv_result = await services.shell_runner.run("python -m venv .venv", project_path)
+                if venv_result["success"]:
+                    fixes_applied.append("Created virtual environment (.venv)")
+                    # Re-detect to get the new Python path
+                    venv_path, venv_python = _detect_virtual_env(project_path)
+                    # Update commands to use venv Python
+                    if filename == "requirements.txt":
+                        config["commands"] = _build_python_commands(venv_python, "-m pip install -r requirements.txt")
+                    elif filename == "pyproject.toml":
+                        config["commands"] = _get_pyproject_commands(project_path, venv_python)
+                    elif filename == "setup.py":
+                        config["commands"] = _build_python_commands(venv_python, "-m pip install -e .")
+                else:
+                    results.append(f"⚠️ {config['name']}: Could not create virtual environment, will try system Python")
+
+        # Try standard commands first
+        install_success = False
+        last_error = ""
+        last_output = ""
+
+        for command in config["commands"]:
+            result = await services.shell_runner.run(command, project_path)
+            commands_executed.append(command)
+
+            if result["success"]:
+                results.append(f"✅ {config['name']}: Installed successfully using `{command}`")
+                install_success = True
+                break
+            else:
+                last_error = result.get("error", "")
+                last_output = result.get("output", "")
+                # Try next command if this one failed
+                if result.get("exit_code") != 0:
+                    continue
+
+        # If install failed and this dependency type is fixable, try to fix it
+        if not install_success and config.get("fixable", False):
+            LOGGER.info("Install failed for %s, attempting to fix...", config["name"])
+            fix_result = await _attempt_dependency_fix(
+                services, session, project_path, filename, config, last_error, last_output
+            )
+
+            if fix_result["fixed"]:
+                fixes_applied.extend(fix_result["fixes"])
+
+                # Retry install after fix
+                for command in config["commands"]:
+                    retry_result = await services.shell_runner.run(command, project_path)
+                    commands_executed.append(f"{command} (after fix)")
+
+                    if retry_result["success"]:
+                        results.append(f"✅ {config['name']}: Installed successfully after fixes using `{command}`")
+                        install_success = True
+                        break
+                    else:
+                        last_error = retry_result.get("error", "")
+
+            if not install_success:
+                # Report failure with fix attempts
+                error_msg = f"❌ {config['name']}: Failed to install dependencies"
+                if last_error:
+                    error_msg += f"\n   Error: {last_error[:500]}"
+                if fix_result["fixes"]:
+                    error_msg += f"\n   Attempted fixes: {', '.join(fix_result['fixes'])}"
+                results.append(error_msg)
+        elif not install_success:
+            # Not fixable, just report failure
+            error_msg = f"❌ {config['name']}: Failed to install dependencies"
+            if last_error:
+                error_msg += f"\n   Error: {last_error[:500]}"
+            results.append(error_msg)
+
+    # Also check for virtual environment setup
+    venv_paths = [project_path / ".venv", project_path / "venv", project_path / "env"]
+    venv_found = any(v.exists() for v in venv_paths)
+
+    if venv_found:
+        results.append("ℹ️ Virtual environment detected. Make sure to activate it before running the project.")
+
+    # Success if at least one dependency type was installed
+    success = any("✅" in r for r in results)
+
+    if success:
+        validation = await _validate_and_fix_installed_project(services, session, project_path)
+        commands_executed.extend(validation["commands_executed"])
+        fixes_applied.extend(validation["fixes_applied"])
+        results.append(validation["message"])
+        success = bool(validation["success"])
+
+    return {
+        "success": success,
+        "message": "\n\n".join(results),
+        "commands_executed": commands_executed,
+        "fixes_applied": fixes_applied,
+    }
+
+
+async def _attempt_dependency_fix(
+    services: RuntimeServices,
+    session: UserSession,
+    project_path: Path,
+    filename: str,
+    config: dict[str, Any],
+    error_output: str,
+    command_output: str,
+) -> dict[str, Any]:
+    """Attempt to fix dependency installation issues."""
+    fixes_applied = []
+    file_path = project_path / filename
+
+    try:
+        content = file_path.read_text(encoding="utf-8")
+    except Exception as e:
+        LOGGER.warning("Could not read %s for fixing: %s", filename, e)
+        return {"fixed": False, "fixes": [], "error": str(e)}
+
+    # Use Copilot to analyze the error and suggest fixes
+    prompt = (
+        f"Analyze this dependency installation error and suggest fixes.\n\n"
+        f"Dependency file: {filename}\n"
+        f"Project type: {config['name']}\n\n"
+        f"Command output:\n```\n{command_output[:2000]}\n```\n\n"
+        f"Error output:\n```\n{error_output[:2000]}\n```\n\n"
+        f"Current {filename} content:\n```\n{content[:3000]}\n```\n\n"
+        "Provide specific fixes for common issues:\n"
+        "1. Version conflicts - suggest version changes\n"
+        "2. Missing dependencies - identify what's missing\n"
+        "3. Invalid syntax - suggest corrections\n"
+        "4. Platform-specific issues - suggest alternatives\n\n"
+        "Return a JSON response with:\n"
+        '{"fixes": [{"type": "version_update|remove_package|add_package|syntax_fix", '
+        '"target": "package_name", "action": "description", '
+        '"new_content": "optional replacement content"}]}'
+    )
+
+    try:
+        response = await services.copilot_client.call(
+            messages=[{"role": "user", "content": prompt}],
+            model=session.model,
+            system_prompt=(
+                "You are a dependency resolution expert. Analyze installation errors and provide "
+                "concrete fixes. Return valid JSON with specific actions to take."
+            ),
+        )
+
+        # Try to parse the JSON response
+        try:
+            # Look for JSON in the response
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                fix_data = json.loads(json_match.group())
+            else:
+                # Try to parse the whole response
+                fix_data = json.loads(response)
+
+            fixes = fix_data.get("fixes", [])
+
+            for fix in fixes:
+                fix_type = fix.get("type", "")
+                target = fix.get("target", "")
+                new_content = fix.get("new_content", "")
+
+                if fix_type == "version_update" and new_content:
+                    # Write updated content
+                    await services.file_writer.write_file(project_path, filename, new_content)
+                    fixes_applied.append(f"Updated versions in {filename}")
+
+                elif fix_type == "remove_package" and target:
+                    # Remove problematic package
+                    lines = content.splitlines()
+                    filtered_lines = [line for line in lines if target not in line]
+                    new_content = "\n".join(filtered_lines)
+                    if len(filtered_lines) < len(lines):
+                        await services.file_writer.write_file(project_path, filename, new_content)
+                        fixes_applied.append(f"Removed problematic package: {target}")
+
+                elif fix_type == "syntax_fix" and new_content:
+                    await services.file_writer.write_file(project_path, filename, new_content)
+                    fixes_applied.append(f"Fixed syntax in {filename}")
+
+                elif fix_type == "add_package" and target:
+                    # This is informational, user needs to add manually
+                    fixes_applied.append(f"Suggestion: Add package {target}")
+
+        except json.JSONDecodeError:
+            LOGGER.warning("Could not parse fix response as JSON: %s", response[:200])
+
+    except Exception as e:
+        LOGGER.exception("Failed to get fix suggestions from Copilot")
+        return {"fixed": False, "fixes": [], "error": str(e)}
+
+    # Also try common fixes based on error patterns
+    if not fixes_applied:
+        common_fixes = await _apply_common_dependency_fixes(
+            services, project_path, filename, error_output, content
+        )
+        fixes_applied.extend(common_fixes)
+
+    return {
+        "fixed": len(fixes_applied) > 0,
+        "fixes": fixes_applied,
+    }
+
+
+async def _apply_common_dependency_fixes(
+    services: RuntimeServices,
+    project_path: Path,
+    filename: str,
+    error_output: str,
+    content: str,
+) -> list[str]:
+    """Apply common dependency fixes based on error patterns."""
+    fixes_applied = []
+    lowered_error = error_output.lower()
+
+    # Node.js/npm specific fixes
+    if filename == "package.json":
+        # Clear node_modules and reinstall
+        if "enoent" in lowered_error or "cannot find module" in lowered_error:
+            await services.shell_runner.run("rm -rf node_modules package-lock.json", project_path)
+            fixes_applied.append("Cleared node_modules and lock file")
+
+        # Try npm audit fix
+        if "vulnerability" in lowered_error or "audit" in lowered_error:
+            await services.shell_runner.run("npm audit fix --force", project_path)
+            fixes_applied.append("Ran npm audit fix")
+
+    # Python specific fixes
+    if filename in ("requirements.txt", "pyproject.toml", "setup.py"):
+        # Check if virtual environment is missing and create it
+        venv_path, _ = _detect_virtual_env(project_path)
+        if not venv_path and ("venv" in lowered_error or "virtual" in lowered_error):
+            await services.shell_runner.run("python -m venv .venv", project_path)
+            fixes_applied.append("Created virtual environment (.venv)")
+
+        # For pip - Remove version pins for packages that can't be found
+        if filename == "requirements.txt":
+            if "could not find" in lowered_error or "no matching distribution" in lowered_error:
+                lines = content.splitlines()
+                new_lines = []
+                removed_packages = []
+
+                for line in lines:
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        new_lines.append(line)
+                        continue
+
+                    # Check if this package is mentioned in the error
+                    package_match = re.match(r'^([a-zA-Z0-9_-]+)', stripped)
+                    if package_match:
+                        package_name = package_match.group(1).lower()
+                        if package_name in lowered_error:
+                            removed_packages.append(package_name)
+                            continue
+
+                    new_lines.append(line)
+
+                if removed_packages:
+                    new_content = "\n".join(new_lines)
+                    await services.file_writer.write_file(project_path, filename, new_content)
+                    fixes_applied.append(f"Removed problematic packages: {', '.join(removed_packages)}")
+
+            # Try upgrading pip
+            if "pip" in lowered_error:
+                await services.shell_runner.run("python -m pip install --upgrade pip", project_path)
+                fixes_applied.append("Upgraded pip")
+
+    if filename == "pyproject.toml":
+        # Clear lock files based on tool being used
+        if "poetry.lock" in lowered_error or "poetry" in lowered_error:
+            await services.shell_runner.run("rm -f poetry.lock", project_path)
+            fixes_applied.append("Removed poetry.lock for regeneration")
+
+        if "pdm.lock" in lowered_error or "pdm" in lowered_error:
+            await services.shell_runner.run("rm -f pdm.lock", project_path)
+            fixes_applied.append("Removed pdm.lock for regeneration")
+
+        if "uv.lock" in lowered_error or "uv" in lowered_error:
+            await services.shell_runner.run("rm -f uv.lock", project_path)
+            fixes_applied.append("Removed uv.lock for regeneration")
+
+        # Try installing uv as a fast alternative
+        if "pip" in lowered_error and "uv" not in lowered_error:
+            await services.shell_runner.run("pip install uv", project_path)
+            fixes_applied.append("Installed uv for faster Python package management")
+
+    # Go specific fixes
+    if filename == "go.mod":
+        if "go mod tidy" in lowered_error or "missing" in lowered_error:
+            await services.shell_runner.run("go mod tidy", project_path)
+            fixes_applied.append("Ran go mod tidy")
+
+    return fixes_applied
+
+
+async def _validate_and_fix_installed_project(
+    services: RuntimeServices,
+    session: UserSession,
+    project_path: Path,
+    max_attempts: int = 2,
+) -> dict[str, Any]:
+    commands_executed: list[str] = []
+    fixes_applied: list[str] = []
+
+    for attempt in range(1, max_attempts + 1):
+        validation = await _run_project_validation_checks(services, project_path)
+        commands_executed.extend(validation["commands_executed"])
+        if validation["success"]:
+            suffix = "" if attempt == 1 else " after fixes"
+            return {
+                "success": True,
+                "message": f"✅ Project validation passed{suffix}.",
+                "commands_executed": commands_executed,
+                "fixes_applied": fixes_applied,
+            }
+
+        if attempt >= max_attempts:
+            return {
+                "success": False,
+                "message": f"❌ Project validation failed after install:\n{validation['issue'][:1200]}",
+                "commands_executed": commands_executed,
+                "fixes_applied": fixes_applied,
+            }
+
+        fix_result = await _attempt_project_validation_fix(
+            services=services,
+            session=session,
+            project_path=project_path,
+            issue=validation["issue"],
+        )
+        fixes_applied.extend(fix_result["fixes_applied"])
+        if not fix_result["success"]:
+            return {
+                "success": False,
+                "message": f"❌ Project validation failed and auto-fix did not apply changes:\n{validation['issue'][:1200]}",
+                "commands_executed": commands_executed,
+                "fixes_applied": fixes_applied,
+            }
+
+    return {
+        "success": False,
+        "message": "❌ Project validation failed.",
+        "commands_executed": commands_executed,
+        "fixes_applied": fixes_applied,
+    }
+
+
+async def _run_project_validation_checks(services: RuntimeServices, project_path: Path) -> dict[str, Any]:
+    commands = _detect_validation_commands(project_path)
+    commands_executed: list[str] = []
+    issues: list[str] = []
+
+    static_issue = _detect_static_python_issues(project_path)
+    if static_issue:
+        issues.append(static_issue)
+
+    for command, timeout_seconds, timeout_success_pattern in commands:
+        result = await services.shell_runner.run(command, project_path, timeout_seconds=timeout_seconds)
+        commands_executed.append(command)
+        output = _combine_command_output(result)
+
+        if result["success"]:
+            continue
+
+        if result.get("exit_code") == 124 and timeout_success_pattern:
+            if re.search(timeout_success_pattern, output, flags=re.IGNORECASE):
+                continue
+
+        if _is_ignorable_runtime_output(output):
+            continue
+
+        issues.append(f"Command failed: {command}\n{output}")
+
+    if issues:
+        return {
+            "success": False,
+            "issue": "\n\n".join(issues),
+            "commands_executed": commands_executed,
+        }
+
+    return {
+        "success": True,
+        "issue": "",
+        "commands_executed": commands_executed,
+    }
+
+
+def _detect_validation_commands(project_path: Path) -> list[tuple[str, float | None, str | None]]:
+    commands: list[tuple[str, float | None, str | None]] = []
+
+    package_json = project_path / "package.json"
+    if package_json.exists():
+        scripts = _read_package_scripts(package_json)
+        if "build" in scripts:
+            commands.append(("npm run build", 180.0, None))
+        if "test" in scripts and _is_meaningful_test_script(scripts["test"]):
+            commands.append((_build_npm_test_command(scripts["test"]), 120.0, None))
+        return commands
+
+    python_files = list(project_path.glob("*.py")) + list((project_path / "src").glob("*.py") if (project_path / "src").exists() else [])
+    if python_files or (project_path / "requirements.txt").exists() or (project_path / "pyproject.toml").exists():
+        _, python_cmd = _detect_virtual_env(project_path)
+        commands.append((f'"{python_cmd}" -m compileall -q .', 60.0, None))
+        entrypoint = _detect_python_entrypoint(project_path)
+        if entrypoint:
+            commands.append((f'"{python_cmd}" -W error::DeprecationWarning {entrypoint}', 5.0, r"running on|serving flask app|started|uvicorn running"))
+        return commands
+
+    if (project_path / "go.mod").exists():
+        commands.append(("go test ./...", 120.0, None))
+    elif (project_path / "Cargo.toml").exists():
+        commands.append(("cargo test", 180.0, None))
+
+    return commands
+
+
+def _read_package_scripts(package_json: Path) -> dict[str, str]:
+    try:
+        payload = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    scripts = payload.get("scripts")
+    if not isinstance(scripts, dict):
+        return {}
+    return {str(key): str(value) for key, value in scripts.items()}
+
+
+def _is_meaningful_test_script(script: str) -> bool:
+    lowered = script.lower()
+    return "no test specified" not in lowered and "exit 1" not in lowered
+
+
+def _build_npm_test_command(script: str) -> str:
+    lowered = script.lower()
+    if "vitest" in lowered:
+        return "npm test -- --run"
+    if "jest" in lowered or "react-scripts test" in lowered:
+        return "npm test -- --watchAll=false"
+    return "npm test"
+
+
+def _detect_python_entrypoint(project_path: Path) -> str | None:
+    for candidate in ("app.py", "main.py", "run.py", "server.py", "src/app.py", "src/main.py"):
+        if (project_path / candidate).exists():
+            return candidate
+    return None
+
+
+def _detect_static_python_issues(project_path: Path) -> str:
+    offenders: list[str] = []
+    excluded_dirs = {".venv", "venv", "env", "__pycache__", ".git"}
+    for path in project_path.rglob("*.py"):
+        if any(part in excluded_dirs for part in path.parts):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "datetime.utcnow()" in text or "datetime.utcfromtimestamp(" in text:
+            try:
+                relative = path.relative_to(project_path).as_posix()
+            except ValueError:
+                relative = path.name
+            offenders.append(relative)
+
+    if not offenders:
+        return ""
+    return "Deprecated naive UTC datetime usage found in: " + ", ".join(offenders)
+
+
+def _combine_command_output(result: dict[str, Any]) -> str:
+    output = str(result.get("output", "")).strip()
+    error = str(result.get("error", "")).strip()
+    if output and error:
+        return f"stdout:\n{output}\n\nstderr:\n{error}"
+    return output or error or "Unknown command failure"
+
+
+def _is_ignorable_runtime_output(output: str) -> bool:
+    lowered = output.lower()
+    ignorable = (
+        "warning: this is a development server",
+        "press ctrl+c to quit",
+        "command timed out",
+    )
+    has_real_failure = any(token in lowered for token in ("traceback", "error:", "exception", "failed", "deprecationwarning"))
+    return any(token in lowered for token in ignorable) and not has_real_failure
+
+
+async def _attempt_project_validation_fix(
+    services: RuntimeServices,
+    session: UserSession,
+    project_path: Path,
+    issue: str,
+) -> dict[str, Any]:
+    file_tree = _render_directory_tree(project_path, max_depth=4)
+    snippets = _collect_validation_context(project_path, issue)
+    prompt = (
+        "Fix the project validation/runtime issue with minimal file-by-file changes.\n"
+        "Return only JSON in this exact shape:\n"
+        '{"files": [{"path": "relative/path", "content": "full replacement file content"}]}\n\n'
+        "Rules:\n"
+        "- Only change files that are necessary to fix the issue.\n"
+        "- Return full replacement content for each changed file.\n"
+        "- Do not include markdown fences.\n"
+        "- Preserve the app's existing behavior and styling.\n\n"
+        f"Validation issue:\n{issue[:4000]}\n\n"
+        f"Project tree:\n{file_tree[:4000]}\n\n"
+        f"Relevant files:\n{snippets[:12000]}\n"
+    )
+
+    try:
+        response = await services.copilot_client.call(
+            messages=[{"role": "user", "content": prompt}],
+            model=session.model,
+            system_prompt="You are a senior engineer fixing validation failures. Return strict JSON only.",
+        )
+        payload = _extract_json_object(response)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Validation auto-fix planning failed")
+        return {"success": False, "fixes_applied": [f"Auto-fix planning failed: {exc}"]}
+
+    files = payload.get("files")
+    if not isinstance(files, list):
+        return {"success": False, "fixes_applied": []}
+
+    fixes_applied: list[str] = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        relative_path = str(item.get("path", "")).strip()
+        content = item.get("content")
+        if not relative_path or not isinstance(content, str):
+            continue
+        if not _is_safe_project_relative_path(relative_path):
+            continue
+        await services.file_writer.write_file(project_path, relative_path, _strip_code_fences(content))
+        fixes_applied.append(f"Updated {relative_path}")
+
+    return {"success": bool(fixes_applied), "fixes_applied": fixes_applied}
+
+
+def _collect_validation_context(project_path: Path, issue: str) -> str:
+    candidates = _validation_context_candidates(project_path, issue)
+    chunks: list[str] = []
+    for path in candidates[:12]:
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+            relative = path.relative_to(project_path).as_posix()
+        except OSError:
+            continue
+        chunks.append(f"### {relative}\n{content[:5000]}")
+    return "\n\n".join(chunks)
+
+
+def _validation_context_candidates(project_path: Path, issue: str) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    for match in re.findall(r"([A-Za-z0-9_./-]+\.(?:py|js|jsx|ts|tsx|json|toml|txt|html|css))", issue):
+        path = (project_path / match).resolve()
+        try:
+            path.relative_to(project_path.resolve())
+        except ValueError:
+            continue
+        if path.exists() and path.is_file() and path not in seen:
+            candidates.append(path)
+            seen.add(path)
+
+    priority = (
+        "app.py", "main.py", "run.py", "server.py", "package.json", "requirements.txt",
+        "pyproject.toml", "src/app.py", "src/main.py", "src/index.js", "src/main.jsx",
+        "src/App.jsx", "src/App.tsx",
+    )
+    for relative in priority:
+        path = project_path / relative
+        if path.exists() and path.is_file() and path not in seen:
+            candidates.append(path)
+            seen.add(path)
+
+    return candidates
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1605,6 +2352,105 @@ def _env_file_path(application: Application) -> Path:
     if isinstance(configured, Path):
         return configured.resolve()
     return (Path.cwd() / ".env").resolve()
+
+
+def _detect_virtual_env(project_path: Path) -> tuple[Path | None, str]:
+    """Detect virtual environment in project and return (venv_path, python_path)."""
+    venv_names = [".venv", "venv", "env", ".env", "virtualenv"]
+
+    for venv_name in venv_names:
+        venv_path = project_path / venv_name
+        if venv_path.exists() and venv_path.is_dir():
+            # Detect Python path based on OS
+            if os.name == 'nt':  # Windows
+                python_paths = [
+                    venv_path / "Scripts" / "python.exe",
+                    venv_path / "Scripts" / "python",
+                ]
+            else:  # Unix/Linux/Mac
+                python_paths = [
+                    venv_path / "bin" / "python",
+                    venv_path / "bin" / "python3",
+                ]
+
+            for py_path in python_paths:
+                if py_path.exists():
+                    return (venv_path, str(py_path))
+
+    return (None, "python")
+
+
+def _build_python_commands(venv_python: str, pip_args: str) -> list[str]:
+    """Build Python commands with virtual environment support."""
+    commands = []
+
+    # If venv exists, use its Python
+    if venv_python and venv_python != "python":
+        commands.append(f'"{venv_python}" {pip_args}')
+        # Also try pip directly from venv
+        venv_path = Path(venv_python).parent
+        if os.name == 'nt':
+            pip_path = venv_path / "pip.exe"
+        else:
+            pip_path = venv_path / "pip"
+        if pip_path.exists():
+            commands.append(f'"{pip_path}" {pip_args.replace("-m pip ", "")}')
+    else:
+        # No venv detected, use system Python but suggest creating one
+        commands.append(f"python {pip_args}")
+        commands.append(f"python3 {pip_args}")
+        commands.append(f"py {pip_args}")
+
+    return commands
+
+
+def _get_pyproject_commands(project_path: Path, venv_python: str) -> list[str]:
+    """Get install commands for pyproject.toml based on available tools."""
+    commands = []
+
+    # Detect which tool is being used
+    pyproject_path = project_path / "pyproject.toml"
+    if not pyproject_path.exists():
+        return commands
+
+    try:
+        content = pyproject_path.read_text(encoding="utf-8")
+    except Exception:
+        content = ""
+
+    # Check for uv (fastest, preferred)
+    if '[tool.uv]' in content or 'requires = ["hatchling"]' in content:
+        if venv_python and venv_python != "python":
+            commands.append(f'"{venv_python}" -m pip install uv && uv sync')
+            commands.append(f'"{venv_python}" -m pip install uv && uv pip install -e .')
+        commands.append("pip install uv && uv sync")
+        commands.append("pip install uv && uv pip install -e .")
+
+    # Check for PDM
+    if '[tool.pdm]' in content:
+        if venv_python and venv_python != "python":
+            commands.append(f'"{venv_python}" -m pip install pdm && pdm install')
+        commands.append("pip install pdm && pdm install")
+
+    # Check for Poetry
+    if '[tool.poetry]' in content:
+        commands.append("poetry install")
+        if venv_python and venv_python != "python":
+            commands.append(f'"{venv_python}" -m pip install poetry && poetry install')
+
+    # Check for Hatch
+    if '[tool.hatch]' in content:
+        if venv_python and venv_python != "python":
+            commands.append(f'"{venv_python}" -m pip install hatch && hatch env create')
+        commands.append("pip install hatch && hatch env create")
+
+    # Fallback to pip
+    if venv_python and venv_python != "python":
+        commands.append(f'"{venv_python}" -m pip install -e .')
+    commands.append("pip install -e .")
+    commands.append("python -m pip install -e .")
+
+    return commands
 
 
 def _list_generated_projects(projects_root: Path, limit: int = 40) -> list[Path]:

@@ -21,7 +21,7 @@ class ShellRunner:
     def __init__(self, allowed_root: str | Path) -> None:
         self.allowed_root = Path(allowed_root).resolve()
 
-    async def run(self, command: str, cwd: str | Path) -> dict[str, Any]:
+    async def run(self, command: str, cwd: str | Path, timeout_seconds: float | None = None) -> dict[str, Any]:
         work_dir = Path(cwd).resolve()
         if not self._is_allowed_directory(work_dir):
             error = f"Blocked command outside allowed directory: {work_dir}"
@@ -39,7 +39,19 @@ class ShellRunner:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+        except TimeoutError:
+            process.terminate()
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=2.0)
+            except TimeoutError:
+                process.kill()
+                stdout, stderr = await process.communicate()
+
+            output = stdout.decode("utf-8", errors="replace")
+            error = stderr.decode("utf-8", errors="replace")
+            return self._result(False, output, error or f"Command timed out after {timeout_seconds:.1f}s", 124)
 
         output = stdout.decode("utf-8", errors="replace")
         error = stderr.decode("utf-8", errors="replace")
