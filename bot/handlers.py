@@ -187,11 +187,13 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("create", create_command))
+    app.add_handler(CommandHandler("project", project_command))
     app.add_handler(CommandHandler("update", update_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CallbackQueryHandler(model_selection_callback, pattern=r"^model:"))
+    app.add_handler(CallbackQueryHandler(project_selection_callback, pattern=r"^project:"))
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
@@ -224,7 +226,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 f"Default model: {MODEL_LABELS.get(session.model, session.model)}\n\n"
                 "Commands:\n"
                 "/model - change model\n"
-                "/create <prompt> - build a project from prompt\n"
+                "/create <prompt> - build a new project\n"
+                "/project - select an existing project\n"
                 "/update <prompt> - update the active project\n"
                 "/status - show current state\n"
                 "/cancel - cancel running build\n"
@@ -358,6 +361,67 @@ async def create_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = _chat_id(update)
+    if chat_id is None:
+        return
+
+    services = _services(context)
+    session = services.sessions.get(chat_id)
+
+    if not session.is_authenticated:
+        await _safe_send_message(context.application, chat_id, "Use /start first to initialize Copilot SDK.")
+        return
+
+    projects_root = _projects_root(context.application)
+    projects = _list_generated_projects(projects_root, limit=50)
+
+    if not projects:
+        await _safe_send_message(context.application, chat_id, "No generated projects found in your projects directory.")
+        return
+
+    keyboard = []
+    for p in projects:
+        name = p.name
+        keyboard.append([InlineKeyboardButton(name, callback_data=f"project:{name}")])
+
+    await _safe_send_message(
+        context.application,
+        chat_id,
+        "Select a project to set as active:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def project_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.message:
+        return
+
+    await query.answer()
+    chat_id = query.message.chat_id
+    services = _services(context)
+    session = services.sessions.get(chat_id)
+
+    project_name = (query.data or "").split(":", maxsplit=1)[-1]
+    projects_root = _projects_root(context.application)
+    project_path = projects_root / project_name
+
+    if not project_path.exists() or not project_path.is_dir():
+        await _safe_send_message(context.application, chat_id, f"Project '{project_name}' no longer exists.")
+        return
+
+    session.active_project_path = str(project_path)
+    # Re-build project context for chatbot and updates
+    session.project_context = f"Project name: {project_name}\nLocal path: {session.active_project_path}"
+    
+    await _safe_send_message(
+        context.application,
+        chat_id,
+        f"Active project set to: {project_name}\nYou can now use /update to make changes.",
+    )
+
+
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = _chat_id(update)
     if chat_id is None:
@@ -375,7 +439,7 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if not session.active_project_path:
-        await _safe_send_message(context.application, chat_id, "No active project found. Use /create first to generate one.")
+        await _safe_send_message(context.application, chat_id, "No active project found. Use /project to select one or /create to generate a new one.")
         return
 
     update_prompt = " ".join(context.args or []).strip()
@@ -591,8 +655,11 @@ async def _handle_workspace_chat(
         f"User message:\n{user_text}\n"
     )
     try:
+        # Use simple role mapping or filtering if attachments are present.
+        messages = [*history_window, {"role": "user", "content": prompt}]
+        
         response = await services.copilot_client.call(
-            messages=[*history_window, {"role": "user", "content": prompt}],
+            messages=messages,
             model=selected_model,
             system_prompt=(
                 "You are a Telegram coding assistant. "
@@ -608,7 +675,7 @@ async def _handle_workspace_chat(
         await _safe_send_message(application, chat_id, f"Copilot request failed: {exc}")
         return
     except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("Workspace chatbot request failed for chat_id=%s")
+        LOGGER.exception("Workspace chatbot request failed for chat_id=%s", chat_id)
         await _safe_send_message(application, chat_id, f"Workspace chat failed: {exc}")
         return
 
