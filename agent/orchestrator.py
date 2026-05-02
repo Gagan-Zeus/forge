@@ -78,7 +78,7 @@ class BuildOrchestrator:
         created_files: list[str] = []
         generated_contents: dict[str, str] = {}
         warnings: list[str] = []
-        validation_status = "not run (skipped by /project)"
+        validation_status = "not run (skipped by /create)"
 
         try:
             await self._report_status(progress_callback, "PLAN", "Creating project plan...")
@@ -230,7 +230,7 @@ class BuildOrchestrator:
                 success=False,
                 project_name="unknown",
                 project_path="unknown",
-                error="No active project set in session. Use /project first.",
+                error="No active project set in session. Use /create first.",
             )
 
         project_path = Path(session.active_project_path)

@@ -83,7 +83,7 @@ Bot: Copilot SDK connected. Chatbot mode is active.
 Bot: Default model: GPT-5 Mini
 Bot: Commands:
 Bot: /model - change model
-Bot: /project <prompt> - build a project
+Bot: /create <prompt> - build a project
 Bot: /status - show current state
 Bot: /cancel - cancel running build
 Bot: /reset - reset chat state
@@ -106,13 +106,13 @@ Only these models are available through `/model`, with default `gpt-5-mini`:
 
 ## Project Build Command
 
-Project generation runs **only** through `/project`.
+Project generation runs **only** through `/create`.
 
-- Example: `/project build a hello world html page`
-- Regular chat messages (even if they mention "project", "build", or similar terms) stay in normal Copilot chat mode.
+- Example: `/create build a hello world html page`
+- Regular chat messages (even if they mention "create", "build", or similar terms) stay in normal Copilot chat mode.
 - The builder now runs in explicit phases with Telegram status updates: **PLAN -> BUILD -> README -> FINAL**.
 - Files are generated incrementally and written to disk immediately (not as one giant final response).
-- `/project` focuses on project creation and does not run post-generation tests/validation.
+- `/create` focuses on project creation and does not run post-generation tests/validation.
 - Dependency manifests (`requirements.txt`, `package.json`) are refreshed to current registry versions during generation.
 
 ## Troubleshooting

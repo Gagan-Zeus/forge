@@ -186,7 +186,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("model", model_command))
-    app.add_handler(CommandHandler("project", project_command))
+    app.add_handler(CommandHandler("create", create_command))
     app.add_handler(CommandHandler("update", update_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("reset", reset_command))
@@ -224,7 +224,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 f"Default model: {MODEL_LABELS.get(session.model, session.model)}\n\n"
                 "Commands:\n"
                 "/model - change model\n"
-                "/project <prompt> - build a project from prompt\n"
+                "/create <prompt> - build a project from prompt\n"
                 "/update <prompt> - update the active project\n"
                 "/status - show current state\n"
                 "/cancel - cancel running build\n"
@@ -316,7 +316,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def create_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = _chat_id(update)
     if chat_id is None:
         return
@@ -345,7 +345,7 @@ async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _safe_send_message(
             context.application,
             chat_id,
-            "Usage: /project <build prompt>\nExample: /project build a hello world html page",
+            "Usage: /create <build prompt>\nExample: /create build a hello world html page",
         )
         return
 
@@ -375,7 +375,7 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if not session.active_project_path:
-        await _safe_send_message(context.application, chat_id, "No active project found. Use /project first to generate one.")
+        await _safe_send_message(context.application, chat_id, "No active project found. Use /create first to generate one.")
         return
 
     update_prompt = " ".join(context.args or []).strip()
