@@ -75,23 +75,6 @@ copilot auth login
 
 Then run the bot and send `/start`. The bot checks CLI auth state through the SDK and enters chatbot mode.
 
-## Example Conversation (ASCII)
-
-```text
-You: /start
-Bot: Copilot SDK connected. Chatbot mode is active.
-Bot: Default model: GPT-5 Mini
-Bot: Commands:
-Bot: /model - change model
-Bot: /create <prompt> - build a project
-Bot: /status - show current state
-Bot: /cancel - cancel running build
-Bot: /reset - reset chat state
-You: /model
-Bot: Current model: GPT-5 Mini
-Bot: Choose a model: [buttons]
-```
-
 ## Copilot Models
 
 Only these models are available through `/model`, with default `gpt-5-mini`:
@@ -131,6 +114,27 @@ The `/project` command allows you to select an existing project from your direct
 - Usage: `/project`
 - Telegram will display inline buttons for each project directory found in your `PROJECTS_DIR`.
 - Selecting a project sets it as active, allowing you to use `/update` or `/github` immediately.
+
+## Chatbot Tool Execution
+
+The chatbot mode now supports tool execution! When you chat with the bot, it can:
+
+- **Execute shell commands** - Run commands in your project directory (e.g., "run npm test", "show git status")
+- **Read files** - Read contents of any file in your projects (e.g., "read README.md", "show me package.json")
+- **List directories** - Show directory contents (e.g., "list the files", "what's in the src folder")
+- **Get file info** - See file size, type, and modification date
+- **Count files** - Get total file counts in directories
+- **Search files** - Find files by pattern (e.g., "find all .js files")
+- **Get project structure** - Display a tree view of your project
+
+The chatbot will automatically use these tools when you ask it to perform actions like:
+- "Summarize this project" - Reads files and provides a summary
+- "Show me the project structure" - Displays a tree view
+- "Run the tests" - Executes test commands
+- "Check git status" - Runs git commands
+- "What files are in this project?" - Lists all files
+
+Note: Commands are sandboxed to your `PROJECTS_DIR` for security. Dangerous commands like `sudo`, `rm -rf /`, `curl`, `wget`, and `eval` are blocked.
 
 ## Troubleshooting
 

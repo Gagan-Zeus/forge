@@ -762,31 +762,92 @@ async def _handle_workspace_chat(
     active_project = session.active_project_path or "none"
     history_window = session.chat_history[-(PROJECT_CHAT_HISTORY_TURNS * 2) :]
 
+    # Build available tools description
+    tools_description = _build_tools_description()
+
     prompt = (
-        "Respond as a workspace-aware coding chatbot.\n"
+        "Respond as a workspace-aware coding chatbot with tool execution capabilities.\n"
         f"Generated projects root: {projects_root}\n"
         f"Known generated projects:\n{workspace_projects_text}\n\n"
         f".env key status (values hidden):\n{env_keys_text}\n\n"
         f"Integration status:\n{integration_status_text}\n\n"
         f"Active project path: {active_project}\n\n"
+        f"Available tools:\n{tools_description}\n\n"
+        "When you need to use a tool, include a TOOL_CALL block in your response like:\n"
+        "```tool\n"
+        "{\n"
+        '  "tool": "tool_name",\n'
+        '  "params": {\n'
+        '    "param1": "value1"\n'
+        "  }\n"
+        "}\n"
+        "```\n"
+        "You can make multiple tool calls in sequence if needed.\n\n"
         f"User message:\n{user_text}\n"
     )
+
+    max_tool_iterations = 5
+    current_iteration = 0
+    conversation_messages = [*history_window, {"role": "user", "content": prompt}]
+    final_response = ""
+
     try:
-        # Use simple role mapping or filtering if attachments are present.
-        messages = [*history_window, {"role": "user", "content": prompt}]
-        
-        response = await services.copilot_client.call(
-            messages=messages,
-            model=selected_model,
-            system_prompt=(
-                "You are a Telegram coding assistant. "
-                "Only assume access to the generated projects directory provided in context and .env key metadata. "
-                "Do not claim access outside that directory. "
-                "If GITHUB_TOKEN is set, you can suggest GitHub push operations for generated projects. "
-                "If VERCEL_TOKEN is set, acknowledge token availability; if automatic deploy wiring is not explicit, state that clearly and provide safe next steps."
-            ),
-            attachments=attachments or None,
-        )
+        while current_iteration < max_tool_iterations:
+            response = await services.copilot_client.call(
+                messages=conversation_messages,
+                model=selected_model,
+                system_prompt=(
+                    "You are a Telegram coding assistant with tool execution capabilities. "
+                    "You can execute shell commands, read files, list directories, and more. "
+                    "When the user asks you to perform an action like 'show me the files', 'read this file', "
+                    "'run this command', or 'summarize the project', use the available tools to actually "
+                    "perform the task and provide real results. "
+                    "Always use TOOL_CALL blocks when you need to execute commands or access files. "
+                    "After receiving tool results, analyze them and provide a helpful response to the user."
+                ),
+                attachments=attachments if current_iteration == 0 else None,
+            )
+
+            response = response.strip()
+            if not response:
+                break
+
+            # Check for tool calls
+            tool_calls = _extract_tool_calls(response)
+            if not tool_calls:
+                final_response = response
+                break
+
+            # Execute tool calls and collect results
+            tool_results = []
+            for tool_call in tool_calls:
+                result = await _execute_tool(tool_call, services, projects_root, session.active_project_path)
+                tool_results.append(result)
+
+            # Append the assistant's response and tool results to conversation
+            conversation_messages.append({"role": "assistant", "content": response})
+
+            # Build tool results message
+            tool_results_text = "Tool execution results:\n\n"
+            for i, result in enumerate(tool_results):
+                tool_results_text += f"Tool {i+1}: {result['tool']}\n"
+                if result['success']:
+                    tool_results_text += f"Success: {result['output'][:2000]}"
+                    if len(result['output']) > 2000:
+                        tool_results_text += "... (truncated)"
+                    tool_results_text += "\n"
+                else:
+                    tool_results_text += f"Error: {result['error']}\n"
+                tool_results_text += "\n"
+
+            tool_results_text += "Now provide a helpful response to the user based on these results."
+            conversation_messages.append({"role": "user", "content": tool_results_text})
+
+            current_iteration += 1
+
+        if not final_response:
+            final_response = response
+
     except CopilotAPIError as exc:
         LOGGER.warning("Workspace chatbot Copilot API failure for chat_id=%s: %s", chat_id, exc)
         await _safe_send_message(application, chat_id, f"Copilot request failed: {exc}")
@@ -796,13 +857,13 @@ async def _handle_workspace_chat(
         await _safe_send_message(application, chat_id, f"Workspace chat failed: {exc}")
         return
 
-    response = response.strip()
-    if not response:
+    final_response = final_response.strip()
+    if not final_response:
         await _safe_send_message(application, chat_id, "Copilot returned an empty response.")
         return
 
-    _append_project_chat_history(session, user_text, response)
-    await _safe_send_message(application, chat_id, _bounded_chat_reply(response))
+    _append_project_chat_history(session, user_text, final_response)
+    await _safe_send_message(application, chat_id, _bounded_chat_reply(final_response))
 
 
 async def _handle_project_build_request(
@@ -1191,6 +1252,243 @@ def _append_project_chat_history(session: UserSession, user_text: str, assistant
 
 def _bounded_chat_reply(text: str) -> str:
     return text if len(text) <= PROJECT_CHAT_MAX_REPLY_CHARS else text[:PROJECT_CHAT_MAX_REPLY_CHARS] + "..."
+
+
+def _build_tools_description() -> str:
+    return """- shell_run: Execute shell commands in the projects directory
+  Parameters: {"command": "string", "cwd": "optional path relative to projects root"}
+  
+- read_file: Read contents of a file
+  Parameters: {"path": "relative path from active project or absolute from projects root"}
+  
+- list_directory: List files and directories
+  Parameters: {"path": "optional directory path, defaults to active project"}
+  
+- file_info: Get file metadata (size, type, last modified)
+  Parameters: {"path": "file path"}
+  
+- count_files: Count files in a directory
+  Parameters: {"path": "directory path"}
+  
+- search_files: Search for files by pattern
+  Parameters: {"pattern": "glob pattern", "path": "optional directory to search in"}
+  
+- get_project_structure: Get a tree-like view of project structure
+  Parameters: {"path": "project path", "max_depth": "optional depth limit (default 3)"}"""
+
+
+def _extract_tool_calls(text: str) -> list[dict[str, Any]]:
+    """Extract tool calls from model response."""
+    tool_calls = []
+
+    # Match ```tool\n{...}\n``` blocks
+    tool_pattern = re.compile(r'```tool\s*\n(.*?)\n```', re.DOTALL)
+    for match in tool_pattern.finditer(text):
+        try:
+            json_str = match.group(1).strip()
+            tool_call = json.loads(json_str)
+            if "tool" in tool_call:
+                tool_calls.append(tool_call)
+        except json.JSONDecodeError:
+            LOGGER.warning("Failed to parse tool call: %s", match.group(1)[:100])
+
+    return tool_calls
+
+
+async def _execute_tool(
+    tool_call: dict[str, Any],
+    services: RuntimeServices,
+    projects_root: Path,
+    active_project_path: str | None,
+) -> dict[str, Any]:
+    """Execute a tool call and return the result."""
+    tool_name = tool_call.get("tool", "")
+    params = tool_call.get("params", {})
+
+    result: dict[str, Any] = {"tool": tool_name, "success": False, "output": "", "error": ""}
+
+    try:
+        if tool_name == "shell_run":
+            command = params.get("command", "")
+            cwd = params.get("cwd", "")
+            if active_project_path:
+                work_dir = Path(active_project_path)
+            else:
+                work_dir = projects_root
+            if cwd:
+                work_dir = projects_root / cwd
+
+            shell_result = await services.shell_runner.run(command, work_dir)
+            result["success"] = shell_result["success"]
+            result["output"] = shell_result["output"]
+            result["error"] = shell_result["error"]
+            result["exit_code"] = shell_result.get("exit_code", 0)
+
+        elif tool_name == "read_file":
+            file_path = params.get("path", "")
+            if active_project_path:
+                full_path = Path(active_project_path) / file_path
+            else:
+                full_path = projects_root / file_path
+
+            if not full_path.exists():
+                result["error"] = f"File not found: {file_path}"
+            elif not full_path.is_file():
+                result["error"] = f"Path is not a file: {file_path}"
+            else:
+                try:
+                    content = full_path.read_text(encoding="utf-8", errors="replace")
+                    result["success"] = True
+                    result["output"] = content
+                except Exception as e:
+                    result["error"] = f"Failed to read file: {e}"
+
+        elif tool_name == "list_directory":
+            dir_path = params.get("path", "")
+            if dir_path:
+                if active_project_path:
+                    full_path = Path(active_project_path) / dir_path
+                else:
+                    full_path = projects_root / dir_path
+            else:
+                full_path = Path(active_project_path) if active_project_path else projects_root
+
+            if not full_path.exists():
+                result["error"] = f"Directory not found: {dir_path}"
+            elif not full_path.is_dir():
+                result["error"] = f"Path is not a directory: {dir_path}"
+            else:
+                try:
+                    items = []
+                    for item in sorted(full_path.iterdir()):
+                        item_type = "dir" if item.is_dir() else "file"
+                        items.append(f"{item.name} ({item_type})")
+                    result["success"] = True
+                    result["output"] = "\n".join(items) if items else "(empty directory)"
+                except Exception as e:
+                    result["error"] = f"Failed to list directory: {e}"
+
+        elif tool_name == "file_info":
+            file_path = params.get("path", "")
+            if active_project_path:
+                full_path = Path(active_project_path) / file_path
+            else:
+                full_path = projects_root / file_path
+
+            if not full_path.exists():
+                result["error"] = f"File not found: {file_path}"
+            else:
+                try:
+                    stat = full_path.stat()
+                    info_lines = [
+                        f"Path: {file_path}",
+                        f"Type: {'directory' if full_path.is_dir() else 'file'}",
+                        f"Size: {stat.st_size} bytes",
+                        f"Modified: {stat.st_mtime}",
+                    ]
+                    result["success"] = True
+                    result["output"] = "\n".join(info_lines)
+                except Exception as e:
+                    result["error"] = f"Failed to get file info: {e}"
+
+        elif tool_name == "count_files":
+            dir_path = params.get("path", ".")
+            if active_project_path:
+                full_path = Path(active_project_path) / dir_path
+            else:
+                full_path = projects_root / dir_path
+
+            if not full_path.exists():
+                result["error"] = f"Directory not found: {dir_path}"
+            elif not full_path.is_dir():
+                result["error"] = f"Path is not a directory: {dir_path}"
+            else:
+                try:
+                    count = _count_project_files(full_path, limit=10000)
+                    result["success"] = True
+                    result["output"] = f"Total files: {count}"
+                except Exception as e:
+                    result["error"] = f"Failed to count files: {e}"
+
+        elif tool_name == "search_files":
+            pattern = params.get("pattern", "")
+            search_path = params.get("path", ".")
+            if active_project_path:
+                full_path = Path(active_project_path) / search_path
+            else:
+                full_path = projects_root / search_path
+
+            if not full_path.exists():
+                result["error"] = f"Directory not found: {search_path}"
+            else:
+                try:
+                    matches = list(full_path.glob(pattern))
+                    result["success"] = True
+                    result["output"] = "\n".join(str(m.relative_to(full_path)) for m in matches[:100])
+                    if len(matches) > 100:
+                        result["output"] += f"\n... and {len(matches) - 100} more"
+                except Exception as e:
+                    result["error"] = f"Failed to search files: {e}"
+
+        elif tool_name == "get_project_structure":
+            project_path = params.get("path", ".")
+            max_depth = params.get("max_depth", 3)
+            if active_project_path:
+                full_path = Path(active_project_path) / project_path
+            else:
+                full_path = projects_root / project_path
+
+            if not full_path.exists():
+                result["error"] = f"Directory not found: {project_path}"
+            else:
+                try:
+                    structure = _render_directory_tree(full_path, max_depth=max_depth)
+                    result["success"] = True
+                    result["output"] = structure
+                except Exception as e:
+                    result["error"] = f"Failed to get project structure: {e}"
+
+        else:
+            result["error"] = f"Unknown tool: {tool_name}"
+
+    except Exception as e:
+        result["error"] = f"Tool execution error: {e}"
+        LOGGER.exception("Tool execution failed for %s", tool_name)
+
+    return result
+
+
+def _render_directory_tree(path: Path, max_depth: int = 3, current_depth: int = 0, prefix: str = "") -> str:
+    """Render a tree-like directory structure."""
+    if current_depth >= max_depth:
+        return ""
+
+    lines = []
+    try:
+        items = sorted(path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+        excluded_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"}
+
+        for i, item in enumerate(items):
+            if item.name.startswith(".") and item.name not in {".env", ".gitignore"}:
+                continue
+            if item.is_dir() and item.name in excluded_dirs:
+                continue
+
+            is_last = i == len(items) - 1
+            connector = "└── " if is_last else "├── "
+            lines.append(f"{prefix}{connector}{item.name}")
+
+            if item.is_dir() and current_depth < max_depth - 1:
+                extension = "    " if is_last else "│   "
+                sub_tree = _render_directory_tree(item, max_depth, current_depth + 1, prefix + extension)
+                if sub_tree:
+                    lines.append(sub_tree)
+    except PermissionError:
+        lines.append(f"{prefix}(permission denied)")
+    except Exception as e:
+        lines.append(f"{prefix}(error: {e})")
+
+    return "\n".join(lines)
 
 
 def _looks_like_push_request(user_text: str) -> bool:
