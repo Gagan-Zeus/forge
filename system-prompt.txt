@@ -87,3 +87,5 @@ You MUST follow this format EXACTLY:
 # full code
 
 Generate a COMPLETE end-to-end production-ready project. Do not skip anything.
+Dont put any Instructions given by the user in the Frontend of the app like python server, built with node.js etc.
+Websites Generated Should be professional and Production Ready.
