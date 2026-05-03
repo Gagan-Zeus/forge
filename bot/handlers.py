@@ -225,7 +225,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             context.application,
             chat_id,
             (
-                "Copilot SDK connected. Chatbot mode is active.\n"
+                "Copilot SDK connected.\n"
                 f"Default model: {MODEL_LABELS.get(session.model, session.model)}\n\n"
                 "Commands:\n"
                 "/model - change model\n"
@@ -424,7 +424,7 @@ async def project_selection_callback(update: Update, context: ContextTypes.DEFAU
     await _safe_send_message(
         context.application,
         chat_id,
-        f"Active project set to: {project_name}\nYou can now use /update to make changes.",
+        f"Active project set to: {project_name}\n",
     )
 
 
