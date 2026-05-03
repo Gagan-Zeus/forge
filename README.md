@@ -10,6 +10,7 @@ Forge is a Telegram-triggered autonomous coding agent that turns a project idea 
 - A Telegram bot token from BotFather
 - GitHub Copilot CLI installed and available in `PATH`
 - Git installed and available in `PATH`
+- Vercel CLI installed and available in `PATH` for `/vercel` deployments
 - (Optional) GitHub account with permissions to create repositories
 
 ## Setup
@@ -36,6 +37,8 @@ Forge is a Telegram-triggered autonomous coding agent that turns a project idea 
     - `TELEGRAM_BOT_TOKEN`
     - `GITHUB_USERNAME`
     - `GITHUB_TOKEN` (recommended for GitHub push; PAT with repo permissions)
+    - `VERCEL_TOKEN` (optional; recommended for non-interactive Vercel CLI deploys)
+    - `VERCEL_SCOPE` (optional; team or user scope for Vercel deploys)
     - `PROJECTS_DIR` (Change to your Preffered Directory. default: `./generated_projects`)
     - `SYSTEM_PROMPT_PATH` (optional, default: `./system-prompt.txt`; loaded as hidden base system prompt)
 
@@ -106,6 +109,21 @@ The `/github` command allows you to push the active project to a GitHub reposito
 - Example: `/github my-awesome-project --branch develop`
 - If no branch is specified, it defaults to `main`.
 - The repository name is required for the first push; subsequent pushes to the same repo will use the saved name if not provided.
+
+## Vercel Deploy Command
+
+The `/vercel` command deploys the active project through Vercel CLI.
+
+- Usage: `/vercel [--prod] [--force] [--target <environment>]`
+- Example preview deploy: `/vercel`
+- Example production deploy: `/vercel --prod`
+- Requires an active project selected with `/project` or created with `/create`
+- Uses `vercel deploy --yes` for non-interactive deployment
+- If the active project contains both `frontend/` and `backend/`, each deployable folder is deployed separately
+- Unlinked split folders use Vercel project names like `<project>-frontend` and `<project>-backend`
+- Loads `.env` from the project root and overlays `frontend/.env` or `backend/.env` for split deployments
+- Uploads `.env` values to the deployment as both runtime env (`--env`) and build env (`--build-env`)
+- Uses `VERCEL_TOKEN` and `VERCEL_SCOPE` from the bot `.env` when present; otherwise it relies on the local Vercel CLI login
 
 ## Project Selection Command
 

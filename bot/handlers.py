@@ -30,6 +30,7 @@ from models.copilot_client import CopilotAPIError, CopilotAuthError, CopilotClie
 from tools.file_writer import FileWriter
 from tools.github_pusher import GitHubPusher
 from tools.shell_runner import ShellRunner
+from tools.vercel_deployer import VercelDeployer, VercelDeployResult
 
 LOGGER = logging.getLogger(__name__)
 
@@ -136,6 +137,7 @@ class RuntimeServices:
     file_writer: FileWriter
     shell_runner: ShellRunner
     github_pusher: GitHubPusher | None
+    vercel_deployer: VercelDeployer
 
 
 def run_bot(telegram_token: str, github_username: str, github_token: str, projects_dir: str) -> None:
@@ -163,6 +165,11 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
         access_token_provider=github_access_token_provider,
         shell_runner=shell_runner,
     )
+    vercel_deployer = VercelDeployer(
+        shell_runner=shell_runner,
+        token=os.getenv("VERCEL_TOKEN", ""),
+        scope=os.getenv("VERCEL_SCOPE", ""),
+    )
     orchestrator = BuildOrchestrator(
         copilot_client=copilot_client,
         planner=planner,
@@ -179,6 +186,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
         file_writer=file_writer,
         shell_runner=shell_runner,
         github_pusher=github_pusher,
+        vercel_deployer=vercel_deployer,
     )
     app.bot_data["build_tasks"] = {}
     app.bot_data["projects_root"] = projects_path
@@ -189,6 +197,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     app.add_handler(CommandHandler("create", create_command))
     app.add_handler(CommandHandler("project", project_command))
     app.add_handler(CommandHandler("github", github_command))
+    app.add_handler(CommandHandler("vercel", vercel_command))
     app.add_handler(CommandHandler("update", update_command))
     app.add_handler(CommandHandler("install", install_command))
     app.add_handler(CommandHandler("delete", delete_command))
@@ -232,6 +241,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "/create <prompt> - build a new project\n"
                 "/project - select an existing project\n"
                 "/github <repo_name> [--branch <branch>] - push to GitHub\n"
+                "/vercel [--prod] - deploy the active project with Vercel CLI\n"
                 "/update <prompt> - update the active project\n"
                 "/delete - delete the active project directory\n"
                 "/install - install project dependencies\n"
@@ -418,6 +428,7 @@ async def project_selection_callback(update: Update, context: ContextTypes.DEFAU
         return
 
     session.active_project_path = str(project_path)
+    session.active_vercel_urls = []
     # Re-build project context for chatbot and updates
     session.project_context = f"Project name: {project_name}\nLocal path: {session.active_project_path}"
     
@@ -488,6 +499,80 @@ async def github_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as exc:
         LOGGER.exception("GitHub push failed for chat_id=%s", chat_id)
         await _safe_send_message(context.application, chat_id, f"GitHub push failed: {exc}")
+
+
+async def vercel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = _chat_id(update)
+    if chat_id is None:
+        return
+
+    services = _services(context)
+    session = services.sessions.get(chat_id)
+
+    if not session.is_authenticated:
+        await _safe_send_message(context.application, chat_id, "Use /start first to initialize Copilot SDK.")
+        return
+
+    if session.is_building:
+        await _safe_send_message(context.application, chat_id, "A task is already running. Use /status to check progress.")
+        return
+
+    if not session.active_project_path:
+        await _safe_send_message(context.application, chat_id, "No active project found. Use /project to select one or /create to generate a new one.")
+        return
+
+    project_path = Path(session.active_project_path)
+    if not project_path.exists() or not project_path.is_dir():
+        await _safe_send_message(context.application, chat_id, f"Project path does not exist: {project_path}")
+        return
+
+    options = _parse_vercel_args(context.args or [])
+    if options["error"]:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            (
+                f"{options['error']}\n"
+                "Usage: /vercel [--prod] [--force] [--target <environment>]\n"
+                "Example: /vercel --prod"
+            ),
+        )
+        return
+
+    deploy_targets = services.vercel_deployer.discover_targets(project_path)
+    target_names = ", ".join(target.name for target in deploy_targets)
+    environment = "production" if options["production"] else options["target"] or "preview"
+    env_summary = _render_vercel_env_summary(deploy_targets)
+
+    session.is_building = True
+    session.build_progress = f"Deploying to Vercel ({environment}): {target_names}"
+    await _safe_send_message(
+        context.application,
+        chat_id,
+        (
+            f"Deploying to Vercel ({environment}): {target_names}\n"
+            f"{env_summary}\n"
+            "Using `vercel deploy --yes` for each target."
+        ),
+    )
+
+    try:
+        results = await services.vercel_deployer.deploy_project(
+            project_path,
+            production=bool(options["production"]),
+            force=bool(options["force"]),
+            target=str(options["target"]),
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Vercel deployment failed for chat_id=%s", chat_id)
+        await _safe_send_message(context.application, chat_id, f"Vercel deployment failed: {exc}")
+        return
+    finally:
+        session.is_building = False
+        session.build_progress = "Idle"
+
+    session.active_vercel_urls = [result.deployment_url for result in results if result.success and result.deployment_url]
+    await _safe_send_message(context.application, chat_id, _render_vercel_results(results))
 
 
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -574,6 +659,7 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _safe_send_message(context.application, chat_id, f"Project path '{project_path}' does not exist.")
         session.active_project_path = ""
         session.active_github_url = ""
+        session.active_vercel_urls = []
         return
 
     # Delete the project directory
@@ -588,6 +674,7 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Clear the active project from session
         session.active_project_path = ""
         session.active_github_url = ""
+        session.active_vercel_urls = []
         session.repo_name = ""
         session.project_context = ""
     except Exception as exc:
@@ -1386,6 +1473,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     projects_root = _projects_root(context.application)
     active_project = session.active_project_path or "none"
+    active_vercel = ", ".join(session.active_vercel_urls) if session.active_vercel_urls else "none"
     project_count = len(_list_generated_projects(projects_root, limit=200))
     copilot_account = await services.copilot_client.get_authenticated_login()
     await _safe_send_message(
@@ -1397,7 +1485,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Copilot GitHub account: {copilot_account}\n"
             f"Current model: {MODEL_LABELS.get(session.model, session.model)}\n"
             f"Generated projects: {project_count}\n"
-            f"Active project: {active_project}"
+            f"Active project: {active_project}\n"
+            f"Vercel deployments: {active_vercel}"
         ),
     )
 
@@ -1647,6 +1736,7 @@ async def _handle_project_build_request(
     if result.success:
         session.active_project_path = result.project_path
         session.active_github_url = result.github_url or ""
+        session.active_vercel_urls = []
         session.project_context = _build_project_chat_context(copy.deepcopy(session), result)
         warnings_text = (
             "\nWarnings:\n" + "\n".join(f"- {item}" for item in result.warnings)
@@ -2251,6 +2341,86 @@ def _looks_like_push_request(user_text: str) -> bool:
         "open a pr",
     )
     return any(keyword in lowered for keyword in keywords)
+
+
+def _parse_vercel_args(args: list[str]) -> dict[str, Any]:
+    normalized = [arg.replace("—", "--").replace("–", "-") for arg in args]
+    options: dict[str, Any] = {
+        "production": False,
+        "force": False,
+        "target": "",
+        "error": "",
+    }
+
+    i = 0
+    while i < len(normalized):
+        arg = normalized[i]
+        if arg in ("--prod", "--production"):
+            options["production"] = True
+            i += 1
+        elif arg == "--preview":
+            options["production"] = False
+            options["target"] = "preview"
+            i += 1
+        elif arg in ("--force", "-f"):
+            options["force"] = True
+            i += 1
+        elif arg == "--target":
+            if i + 1 >= len(normalized):
+                options["error"] = "Missing value for --target."
+                return options
+            options["target"] = normalized[i + 1].strip()
+            i += 2
+        elif arg.startswith("--target="):
+            options["target"] = arg.split("=", maxsplit=1)[-1].strip()
+            i += 1
+        elif arg in ("--help", "-h"):
+            options["error"] = "Usage requested."
+            return options
+        else:
+            options["error"] = f"Unsupported /vercel option: {arg}"
+            return options
+
+    target = str(options["target"])
+    if options["production"] and target:
+        options["error"] = "Use either --prod or --target, not both."
+        return options
+    if target and not re.fullmatch(r"[A-Za-z0-9_-]+", target):
+        options["error"] = "Target must contain only letters, numbers, underscores, or dashes."
+
+    return options
+
+
+def _render_vercel_env_summary(deploy_targets: list[Any]) -> str:
+    lines = []
+    for target in deploy_targets:
+        env_file = str(target.env_file) if target.env_file else "none"
+        env_keys = ", ".join(target.env_keys) if target.env_keys else "none"
+        lines.append(f"- {target.name}: path {target.path}; env file {env_file}; keys: {env_keys}")
+    return "Environment upload plan:\n" + "\n".join(lines)
+
+
+def _render_vercel_results(results: list[VercelDeployResult]) -> str:
+    if not results:
+        return "Vercel deployment did not find any deployable targets."
+
+    success_count = sum(1 for result in results if result.success)
+    lines = [f"Vercel deployment finished: {success_count}/{len(results)} target(s) deployed."]
+
+    for result in results:
+        if result.success:
+            url = result.deployment_url or "(deployment URL not returned)"
+            env_keys = ", ".join(result.target.env_keys) if result.target.env_keys else "none"
+            lines.append(f"\n{result.target.name}: deployed\nURL: {url}\nEnv keys uploaded: {env_keys}")
+        else:
+            error = result.error[:1200] if result.error else "Unknown Vercel CLI error."
+            lines.append(
+                f"\n{result.target.name}: failed (exit {result.exit_code})\n"
+                f"{error}\n"
+                "Check that Vercel CLI is installed and logged in. For non-interactive deployments, set VERCEL_TOKEN in the bot .env."
+            )
+
+    return "\n".join(lines)
 
 
 def _repo_name_from_github_url(github_url: str) -> str:

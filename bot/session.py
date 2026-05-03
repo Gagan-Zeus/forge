@@ -25,6 +25,7 @@ class UserSession:
     chat_history: list[dict[str, str]] = field(default_factory=list)
     active_project_path: str = ""
     active_github_url: str = ""
+    active_vercel_urls: list[str] = field(default_factory=list)
 
 
 class SessionStore:
