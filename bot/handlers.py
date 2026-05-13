@@ -50,37 +50,13 @@ COPILOT_MODEL_OPTIONS = [
     ("Claude Haiku 4.5", "claude-haiku-4.5"),
 ]
 
-# OpenCode models (Zen)
-OPENCODE_DEFAULT_MODEL = "gpt-5.4-mini"
+# OpenCode models (Zen) - Only free models available
+OPENCODE_DEFAULT_MODEL = "minimax-m2.5-free"
 OPENCODE_MODEL_OPTIONS = [
-    # GPT models
-    ("GPT-5.5", "gpt-5.5"),
-    ("GPT-5.5 Pro", "gpt-5.5-pro"),
-    ("GPT-5.4", "gpt-5.4"),
-    ("GPT-5.4 Pro", "gpt-5.4-pro"),
-    ("GPT-5.4 Mini", "gpt-5.4-mini"),
-    ("GPT-5.4 Nano", "gpt-5.4-nano"),
-    ("GPT-5.3 Codex", "gpt-5.3-codex"),
-    ("GPT-5.2", "gpt-5.2"),
-    ("GPT-5.2 Codex", "gpt-5.2-codex"),
-    ("GPT-5.1", "gpt-5.1"),
-    ("GPT-5.1 Codex", "gpt-5.1-codex"),
-    # Claude models
-    ("Claude Opus 4.5", "claude-opus-4-5"),
-    ("Claude Opus 4.6", "claude-opus-4-6"),
-    ("Claude Opus 4.7", "claude-opus-4-7"),
-    ("Claude Sonnet 4.5", "claude-sonnet-4-5"),
-    ("Claude Sonnet 4.6", "claude-sonnet-4-6"),
-    ("Claude Haiku 4.5", "claude-haiku-4-5"),
-    ("Claude Haiku 3.5", "claude-3-5-haiku"),
-    # Gemini models
-    ("Gemini 3.1 Pro", "gemini-3.1-pro"),
-    ("Gemini 3 Flash", "gemini-3-flash"),
-    # Free models
-    ("DeepSeek V4 Flash Free", "deepseek-v4-flash-free"),
     ("MiniMax M2.5 Free", "minimax-m2.5-free"),
-    ("Qwen 3.5 Plus", "qwen3.5-plus"),
-    ("Big Pickle", "big-pickle"),
+    ("DeepSeek V4 Flash Free", "deepseek-v4-flash-free"),
+    ("Ring 2.6 1T Free", "ring-2.6-1t-free"),
+    ("Nemotron 3 Super Free", "nemotron-3-super-free"),
 ]
 
 # Combine all models
@@ -272,6 +248,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CallbackQueryHandler(model_selection_callback, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(provider_selection_callback, pattern=r"^provider:"))
+    app.add_handler(CallbackQueryHandler(start_provider_callback, pattern=r"^start_provider:"))
     app.add_handler(CallbackQueryHandler(project_selection_callback, pattern=r"^project:"))
     app.add_handler(
         MessageHandler(
@@ -292,69 +269,131 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     services = _services(context)
     session = services.sessions.reset(chat_id, keep_auth=False)
+    
+    # Show provider selection on startup
+    keyboard = []
+    
+    # Always show Copilot option
+    keyboard.append([InlineKeyboardButton("Copilot (GitHub)", callback_data="start_provider:copilot")])
+    
+    # Show OpenCode option only if configured
+    if services.model_client.has_opencode:
+        keyboard.append([InlineKeyboardButton("OpenCode", callback_data="start_provider:opencode")])
+    
+    await _safe_send_message(
+        context.application,
+        chat_id,
+        "Welcome! Choose a provider to get started:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
-    try:
-        await services.model_client.ensure_ready()
-        session.is_authenticated = True
-        session.model = services.model_client.get_default_model(session.provider)
-        
-        provider_name = "OpenCode" if session.provider == "opencode" else "Copilot"
-        await _safe_send_message(
-            context.application,
-            chat_id,
-            (
-                f"{provider_name} SDK connected.\n"
-                f"Provider: {session.provider}\n"
-                f"Default model: {MODEL_LABELS.get(session.model, session.model)}\n\n"
-                "Commands:\n"
-                "/provider - change provider (copilot/opencode)\n"
-                "/model - change model\n"
-                "/create <prompt> - build a new project\n"
-                "/project - select an existing project\n"
-                "/github <repo_name> [--branch <branch>] - push to GitHub\n"
-                "/update <prompt> - update the active project\n"
-                "/delete - delete the active project directory\n"
-                "/install - install project dependencies\n"
-                "/status - show current state\n"
-                "/cancel - cancel running build\n"
-                "/reset - reset chat state"
-            ),
-        )
+
+async def start_provider_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle provider selection from /start command."""
+    query = update.callback_query
+    if not query or not query.message:
         return
-    except ModelAuthError as exc:
-        session.is_authenticated = False
-        # Check if it's OpenCode-specific error
-        if services.model_client.has_opencode:
+
+    await query.answer()
+    chat_id = query.message.chat_id
+    services = _services(context)
+    session = services.sessions.get(chat_id)
+    
+    provider = (query.data or "").split(":", maxsplit=1)[-1]
+    if provider not in ("copilot", "opencode"):
+        return
+    
+    session.provider = provider  # type: ignore[assignment]
+    
+    if provider == "copilot":
+        # Try to authenticate with Copilot
+        try:
+            await services.model_client.ensure_ready()
+            session.is_authenticated = True
+            session.model = COPILOT_DEFAULT_MODEL
             await _safe_send_message(
                 context.application,
                 chat_id,
                 (
-                    "Authentication failed.\n"
-                    "For Copilot:\n"
-                    "1) Install GitHub Copilot CLI if missing\n"
-                    "2) Run `copilot -i auth login` in terminal\n\n"
-                    "For OpenCode:\n"
-                    "1) Get your API key at https://opencode.ai/auth\n"
-                    "2) Set OPENCODE_API_KEY in your .env file\n\n"
-                    f"Details: {exc}"
+                    "✅ Copilot SDK connected.\n"
+                    f"Default model: {MODEL_LABELS.get(session.model, session.model)}\n\n"
+                    "Commands:\n"
+                    "/provider - change provider (copilot/opencode)\n"
+                    "/model - change model\n"
+                    "/create <prompt> - build a new project\n"
+                    "/project - select an existing project\n"
+                    "/github <repo_name> [--branch <branch>] - push to GitHub\n"
+                    "/update <prompt> - update the active project\n"
+                    "/delete - delete the active project directory\n"
+                    "/install - install project dependencies\n"
+                    "/status - show current state\n"
+                    "/cancel - cancel running build\n"
+                    "/reset - reset chat state"
                 ),
             )
-        else:
+        except ModelAuthError:
+            session.is_authenticated = False
             await _safe_send_message(
                 context.application,
                 chat_id,
                 (
-                    "Copilot SDK is not ready.\n"
+                    "❌ Copilot authentication failed.\n\n"
+                    "To use Copilot:\n"
                     "1) Install GitHub Copilot CLI if missing\n"
                     "2) Run `copilot -i auth login` in terminal\n"
                     "3) Send /start again\n\n"
-                    f"Details: {exc}"
+                    "Or use /provider to switch to OpenCode (if configured)"
                 ),
             )
-    except Exception as exc:  # noqa: BLE001
-        session.is_authenticated = False
-        LOGGER.exception("Model client initialization failed for chat_id=%s", chat_id)
-        await _safe_send_message(context.application, chat_id, f"Model client initialization failed: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            session.is_authenticated = False
+            LOGGER.exception("Copilot initialization failed for chat_id=%s", chat_id)
+            await _safe_send_message(context.application, chat_id, f"Copilot initialization failed: {exc}")
+    
+    elif provider == "opencode":
+        # Try to authenticate with OpenCode
+        try:
+            await services.model_client.ensure_ready()
+            session.is_authenticated = True
+            session.model = OPENCODE_DEFAULT_MODEL
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                (
+                    "✅ OpenCode connected.\n"
+                    f"Default model: {MODEL_LABELS.get(session.model, session.model)}\n\n"
+                    "Commands:\n"
+                    "/provider - change provider (copilot/opencode)\n"
+                    "/model - change model\n"
+                    "/create <prompt> - build a new project\n"
+                    "/project - select an existing project\n"
+                    "/github <repo_name> [--branch <branch>] - push to GitHub\n"
+                    "/update <prompt> - update the active project\n"
+                    "/delete - delete the active project directory\n"
+                    "/install - install project dependencies\n"
+                    "/status - show current state\n"
+                    "/cancel - cancel running build\n"
+                    "/reset - reset chat state"
+                ),
+            )
+        except ModelAuthError:
+            session.is_authenticated = False
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                (
+                    "❌ OpenCode authentication failed.\n\n"
+                    "To use OpenCode:\n"
+                    "1) Get your API key at https://opencode.ai/auth\n"
+                    "2) Set OPENCODE_API_KEY in your .env file\n"
+                    "3) Send /start again\n\n"
+                    "Or use /provider to switch to Copilot"
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            session.is_authenticated = False
+            LOGGER.exception("OpenCode initialization failed for chat_id=%s", chat_id)
+            await _safe_send_message(context.application, chat_id, f"OpenCode initialization failed: {exc}")
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -396,7 +435,7 @@ async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _safe_send_message(
             context.application,
             chat_id,
-            "Use /start first to initialize.",
+            "Use /start first to initialize and select a provider.",
         )
         return
 
@@ -507,7 +546,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _safe_send_message(
             context.application,
             chat_id,
-            "Use /start first to initialize.",
+            "Use /start first to initialize and select a provider.",
         )
         return
 
@@ -567,7 +606,7 @@ async def create_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _safe_send_message(
             context.application,
             chat_id,
-            "Use /start first to initialize Copilot SDK.",
+            "Use /start first to initialize and select a provider.",
         )
         return
 
@@ -1734,7 +1773,11 @@ async def _handle_workspace_chat(
 
     selected_model = session.model.strip()
     if selected_model not in ALLOWED_MODEL_IDS:
-        selected_model = DEFAULT_MODEL
+        # Use provider-specific default
+        if session.provider == "opencode":
+            selected_model = OPENCODE_DEFAULT_MODEL
+        else:
+            selected_model = COPILOT_DEFAULT_MODEL
 
     projects_root = _projects_root(application)
     workspace_projects_text = _render_workspace_projects(projects_root, limit=40)

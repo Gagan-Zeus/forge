@@ -28,89 +28,21 @@ class OpenCodeClient:
     MAX_CALL_TIMEOUT_SECONDS = 300.0
     DEFAULT_TIMEOUT = 60.0
 
-    # OpenCode Zen available models (from documentation)
+    # OpenCode Zen available models (free tier only)
     DEFAULT_MODELS = (
-        # GPT models
-        "gpt-5.5",
-        "gpt-5.5-pro",
-        "gpt-5.4",
-        "gpt-5.4-pro",
-        "gpt-5.4-mini",
-        "gpt-5.4-nano",
-        "gpt-5.3-codex",
-        "gpt-5.3-codex-spark",
-        "gpt-5.2",
-        "gpt-5.2-codex",
-        "gpt-5.1",
-        "gpt-5.1-codex",
-        "gpt-5.1-codex-max",
-        "gpt-5.1-codex-mini",
-        "gpt-5",
-        "gpt-5-codex",
-        "gpt-5-nano",
-        # Claude models
-        "claude-opus-4-7",
-        "claude-opus-4-6",
-        "claude-opus-4-5",
-        "claude-opus-4-1",
-        "claude-sonnet-4-6",
-        "claude-sonnet-4-5",
-        "claude-sonnet-4",
-        "claude-haiku-4-5",
-        "claude-3-5-haiku",
-        # Gemini models
-        "gemini-3.1-pro",
-        "gemini-3-flash",
-        # Other models
-        "qwen3.6-plus",
-        "qwen3.5-plus",
-        "minimax-m2.7",
-        "minimax-m2.5",
         "minimax-m2.5-free",
-        "glm-5.1",
-        "glm-5",
-        "kimi-k2.5",
-        "kimi-k2.6",
-        "big-pickle",
         "deepseek-v4-flash-free",
         "ring-2.6-1t-free",
         "nemotron-3-super-free",
     )
 
     # Map model names to endpoint types
+    # All free models use /chat/completions endpoint
     MODEL_ENDPOINTS = {
-        # GPT models use /responses endpoint
-        "gpt-5.5": "responses",
-        "gpt-5.5-pro": "responses",
-        "gpt-5.4": "responses",
-        "gpt-5.4-pro": "responses",
-        "gpt-5.4-mini": "responses",
-        "gpt-5.4-nano": "responses",
-        "gpt-5.3-codex": "responses",
-        "gpt-5.3-codex-spark": "responses",
-        "gpt-5.2": "responses",
-        "gpt-5.2-codex": "responses",
-        "gpt-5.1": "responses",
-        "gpt-5.1-codex": "responses",
-        "gpt-5.1-codex-max": "responses",
-        "gpt-5.1-codex-mini": "responses",
-        "gpt-5": "responses",
-        "gpt-5-codex": "responses",
-        "gpt-5-nano": "responses",
-        # Claude models use /messages endpoint
-        "claude-opus-4-7": "messages",
-        "claude-opus-4-6": "messages",
-        "claude-opus-4-5": "messages",
-        "claude-opus-4-1": "messages",
-        "claude-sonnet-4-6": "messages",
-        "claude-sonnet-4-5": "messages",
-        "claude-sonnet-4": "messages",
-        "claude-haiku-4-5": "messages",
-        "claude-3-5-haiku": "messages",
-        # Gemini models use specific model endpoints
-        "gemini-3.1-pro": "models/gemini-3.1-pro",
-        "gemini-3-flash": "models/gemini-3-flash",
-        # All others use /chat/completions
+        "minimax-m2.5-free": "chat/completions",
+        "deepseek-v4-flash-free": "chat/completions",
+        "ring-2.6-1t-free": "chat/completions",
+        "nemotron-3-super-free": "chat/completions",
     }
 
     _known_models: tuple[str, ...] = DEFAULT_MODELS

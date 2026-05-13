@@ -189,14 +189,7 @@ class UnifiedModelClient:
 
     # Provider-specific model defaults
     COPILOT_DEFAULT_MODEL = "gpt-5-mini"
-    
-    # OpenCode default models by category
-    OPENCODE_DEFAULT_MODELS = {
-        "gpt": "gpt-5.4-mini",
-        "claude": "claude-sonnet-4-5",
-        "gemini": "gemini-3-flash",
-        "other": "qwen3.5-plus",
-    }
+    OPENCODE_DEFAULT_MODEL = "minimax-m2.5-free"
 
     def __init__(
         self,
@@ -258,7 +251,7 @@ class UnifiedModelClient:
         prov = provider or self._active_provider
         if prov == "copilot":
             return self.COPILOT_DEFAULT_MODEL
-        return self.OPENCODE_DEFAULT_MODELS["gpt"]
+        return self.OPENCODE_DEFAULT_MODEL
 
     async def is_authenticated(self) -> bool:
         """Check if active client is authenticated."""
@@ -271,6 +264,19 @@ class UnifiedModelClient:
         except ModelAuthError:
             raise
 
+    def _get_client_for_model(self, model: str) -> ModelClient:
+        """Get the appropriate client based on model name."""
+        # Check if it's an OpenCode model
+        opencode_models = {
+            "minimax-m2.5-free",
+            "deepseek-v4-flash-free", 
+            "ring-2.6-1t-free",
+            "nemotron-3-super-free",
+        }
+        if model in opencode_models and self._opencode:
+            return self._opencode
+        return self._copilot
+
     async def call(
         self,
         messages: Sequence[dict[str, str]],
@@ -279,9 +285,10 @@ class UnifiedModelClient:
         attachments: list[dict[str, Any]] | None = None,
         on_assistant_delta: Callable[[str], Awaitable[None] | None] = None,
     ) -> str:
-        """Call the active model."""
+        """Call the appropriate client based on model."""
+        client = self._get_client_for_model(model)
         try:
-            return await self.active_client.call(
+            return await client.call(
                 messages=messages,
                 model=model,
                 system_prompt=system_prompt,
