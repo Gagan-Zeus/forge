@@ -9,7 +9,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -27,14 +27,20 @@ from agent.orchestrator import BuildOrchestrator, BuildResult
 from agent.planner import ProjectPlanner
 from bot.session import SessionStore, UserSession
 from models.copilot_client import CopilotAPIError, CopilotAuthError, CopilotClient
+from models.opencode_client import OpenCodeAPIError, OpenCodeAuthError, OpenCodeClient
+from models.unified_client import UnifiedModelClient, ModelAPIError, ModelAuthError
 from tools.file_writer import FileWriter
 from tools.github_pusher import GitHubPusher
 from tools.shell_runner import ShellRunner
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gpt-5-mini"
-MODEL_OPTIONS: list[tuple[str, str]] = [
+# Provider settings
+DEFAULT_PROVIDER = "copilot"
+
+# Copilot models
+COPILOT_DEFAULT_MODEL = "gpt-5-mini"
+COPILOT_MODEL_OPTIONS = [
     ("GPT-5.3-Codex", "gpt-5.3-codex"),
     ("GPT-5.2-Codex", "gpt-5.2-codex"),
     ("GPT-5.2", "gpt-5.2"),
@@ -43,8 +49,48 @@ MODEL_OPTIONS: list[tuple[str, str]] = [
     ("GPT-4.1", "gpt-4.1"),
     ("Claude Haiku 4.5", "claude-haiku-4.5"),
 ]
-MODEL_LABELS = {value: label for label, value in MODEL_OPTIONS}
-ALLOWED_MODEL_IDS = {value for _, value in MODEL_OPTIONS}
+
+# OpenCode models (Zen)
+OPENCODE_DEFAULT_MODEL = "gpt-5.4-mini"
+OPENCODE_MODEL_OPTIONS = [
+    # GPT models
+    ("GPT-5.5", "gpt-5.5"),
+    ("GPT-5.5 Pro", "gpt-5.5-pro"),
+    ("GPT-5.4", "gpt-5.4"),
+    ("GPT-5.4 Pro", "gpt-5.4-pro"),
+    ("GPT-5.4 Mini", "gpt-5.4-mini"),
+    ("GPT-5.4 Nano", "gpt-5.4-nano"),
+    ("GPT-5.3 Codex", "gpt-5.3-codex"),
+    ("GPT-5.2", "gpt-5.2"),
+    ("GPT-5.2 Codex", "gpt-5.2-codex"),
+    ("GPT-5.1", "gpt-5.1"),
+    ("GPT-5.1 Codex", "gpt-5.1-codex"),
+    # Claude models
+    ("Claude Opus 4.5", "claude-opus-4-5"),
+    ("Claude Opus 4.6", "claude-opus-4-6"),
+    ("Claude Opus 4.7", "claude-opus-4-7"),
+    ("Claude Sonnet 4.5", "claude-sonnet-4-5"),
+    ("Claude Sonnet 4.6", "claude-sonnet-4-6"),
+    ("Claude Haiku 4.5", "claude-haiku-4-5"),
+    ("Claude Haiku 3.5", "claude-3-5-haiku"),
+    # Gemini models
+    ("Gemini 3.1 Pro", "gemini-3.1-pro"),
+    ("Gemini 3 Flash", "gemini-3-flash"),
+    # Free models
+    ("DeepSeek V4 Flash Free", "deepseek-v4-flash-free"),
+    ("MiniMax M2.5 Free", "minimax-m2.5-free"),
+    ("Qwen 3.5 Plus", "qwen3.5-plus"),
+    ("Big Pickle", "big-pickle"),
+]
+
+# Combine all models
+ALL_MODEL_OPTIONS = COPILOT_MODEL_OPTIONS + OPENCODE_MODEL_OPTIONS
+MODEL_LABELS = {value: label for label, value in ALL_MODEL_OPTIONS}
+COPILOT_MODEL_LABELS = {value: label for label, value in COPILOT_MODEL_OPTIONS}
+OPENCODE_MODEL_LABELS = {value: label for label, value in OPENCODE_MODEL_OPTIONS}
+COPILOT_MODEL_IDS = {value for _, value in COPILOT_MODEL_OPTIONS}
+OPENCODE_MODEL_IDS = {value for _, value in OPENCODE_MODEL_OPTIONS}
+ALLOWED_MODEL_IDS = COPILOT_MODEL_IDS | OPENCODE_MODEL_IDS
 PROJECT_CHAT_HISTORY_TURNS = 8
 PROJECT_CHAT_MAX_REPLY_CHARS = 3500
 PROJECT_CHAT_STREAM_MIN_CHARS = 120
@@ -131,7 +177,7 @@ class _StreamingChatReplyPublisher:
 @dataclass
 class RuntimeServices:
     sessions: SessionStore
-    copilot_client: CopilotClient
+    model_client: UnifiedModelClient
     orchestrator: BuildOrchestrator
     file_writer: FileWriter
     shell_runner: ShellRunner
@@ -146,17 +192,45 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     file_writer = FileWriter(projects_path)
     shell_runner = ShellRunner(allowed_root=projects_path)
     github_pat = github_token.strip()
+
+    # Create Copilot client
     copilot_client = CopilotClient(
         cli_path=os.getenv("COPILOT_CLI_PATH", ""),
         github_token=github_pat,
         base_system_prompt_path=os.getenv("SYSTEM_PROMPT_PATH", ""),
     )
-    planner = ProjectPlanner(copilot_client)
+
+    # Create OpenCode client if API key is configured
+    opencode_api_key = os.getenv("OPENCODE_API_KEY", "").strip()
+    opencode_client = None
+    if opencode_api_key:
+        opencode_client = OpenCodeClient(
+            api_key=opencode_api_key,
+            base_url=os.getenv("OPENCODE_BASE_URL"),
+            base_system_prompt_path=os.getenv("SYSTEM_PROMPT_PATH", ""),
+        )
+
+    # Create unified model client
+    default_provider = os.getenv("DEFAULT_MODEL_PROVIDER", "copilot")
+    if default_provider not in ("copilot", "opencode"):
+        default_provider = "copilot"
+
+    model_client = UnifiedModelClient(
+        copilot_client=copilot_client,
+        opencode_client=opencode_client,
+        default_provider=default_provider,  # type: ignore[arg-type]
+    )
+
+    planner = ProjectPlanner(model_client)
 
     async def github_access_token_provider() -> str:
         if github_pat:
             return github_pat
-        return await copilot_client.get_access_token()
+        # Try to get from Copilot (for backwards compatibility)
+        try:
+            return await copilot_client.get_access_token()
+        except Exception:
+            return ""
 
     github_pusher = GitHubPusher(
         github_username=github_username,
@@ -164,7 +238,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
         shell_runner=shell_runner,
     )
     orchestrator = BuildOrchestrator(
-        copilot_client=copilot_client,
+        model_client=model_client,
         planner=planner,
         file_writer=file_writer,
         shell_runner=shell_runner,
@@ -174,7 +248,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     app = Application.builder().token(telegram_token).build()
     app.bot_data["services"] = RuntimeServices(
         sessions=SessionStore(),
-        copilot_client=copilot_client,
+        model_client=model_client,
         orchestrator=orchestrator,
         file_writer=file_writer,
         shell_runner=shell_runner,
@@ -185,6 +259,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     app.bot_data["env_file"] = (Path.cwd() / ".env").resolve()
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("provider", provider_command))
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("create", create_command))
     app.add_handler(CommandHandler("project", project_command))
@@ -196,6 +271,7 @@ def run_bot(telegram_token: str, github_username: str, github_token: str, projec
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CallbackQueryHandler(model_selection_callback, pattern=r"^model:"))
+    app.add_handler(CallbackQueryHandler(provider_selection_callback, pattern=r"^provider:"))
     app.add_handler(CallbackQueryHandler(project_selection_callback, pattern=r"^project:"))
     app.add_handler(
         MessageHandler(
@@ -218,16 +294,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     session = services.sessions.reset(chat_id, keep_auth=False)
 
     try:
-        await services.copilot_client.ensure_ready()
+        await services.model_client.ensure_ready()
         session.is_authenticated = True
-        session.model = DEFAULT_MODEL
+        session.model = services.model_client.get_default_model(session.provider)
+        
+        provider_name = "OpenCode" if session.provider == "opencode" else "Copilot"
         await _safe_send_message(
             context.application,
             chat_id,
             (
-                "Copilot SDK connected.\n"
+                f"{provider_name} SDK connected.\n"
+                f"Provider: {session.provider}\n"
                 f"Default model: {MODEL_LABELS.get(session.model, session.model)}\n\n"
                 "Commands:\n"
+                "/provider - change provider (copilot/opencode)\n"
                 "/model - change model\n"
                 "/create <prompt> - build a new project\n"
                 "/project - select an existing project\n"
@@ -241,23 +321,40 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             ),
         )
         return
-    except CopilotAuthError as exc:
+    except ModelAuthError as exc:
         session.is_authenticated = False
-        await _safe_send_message(
-            context.application,
-            chat_id,
-            (
-                "Copilot SDK is not ready.\n"
-                "1) Install GitHub Copilot CLI if missing\n"
-                "2) Run `copilot -i auth login` in terminal\n"
-                "3) Send /start again\n\n"
-                f"Details: {exc}"
-            ),
-        )
+        # Check if it's OpenCode-specific error
+        if services.model_client.has_opencode:
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                (
+                    "Authentication failed.\n"
+                    "For Copilot:\n"
+                    "1) Install GitHub Copilot CLI if missing\n"
+                    "2) Run `copilot -i auth login` in terminal\n\n"
+                    "For OpenCode:\n"
+                    "1) Get your API key at https://opencode.ai/auth\n"
+                    "2) Set OPENCODE_API_KEY in your .env file\n\n"
+                    f"Details: {exc}"
+                ),
+            )
+        else:
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                (
+                    "Copilot SDK is not ready.\n"
+                    "1) Install GitHub Copilot CLI if missing\n"
+                    "2) Run `copilot -i auth login` in terminal\n"
+                    "3) Send /start again\n\n"
+                    f"Details: {exc}"
+                ),
+            )
     except Exception as exc:  # noqa: BLE001
         session.is_authenticated = False
-        LOGGER.exception("Copilot SDK initialization failed for chat_id=%s", chat_id)
-        await _safe_send_message(context.application, chat_id, f"Copilot SDK initialization failed: {exc}")
+        LOGGER.exception("Model client initialization failed for chat_id=%s", chat_id)
+        await _safe_send_message(context.application, chat_id, f"Model client initialization failed: {exc}")
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -267,17 +364,134 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     services = _services(context)
     previous = services.sessions.get(chat_id)
-    preserved_model = previous.model if previous.model in ALLOWED_MODEL_IDS else DEFAULT_MODEL
     session = services.sessions.reset(chat_id, keep_auth=True)
-    session.model = preserved_model
-    session.is_authenticated = previous.is_authenticated
+    
+    # Preserve provider and select appropriate default model
+    session.provider = previous.provider
+    if session.provider == "opencode":
+        session.model = OPENCODE_DEFAULT_MODEL if previous.model not in OPENCODE_MODEL_IDS else previous.model
+    else:
+        session.model = COPILOT_DEFAULT_MODEL if previous.model not in COPILOT_MODEL_IDS else previous.model
+    
     await _safe_send_message(
         context.application,
         chat_id,
         (
             "Session reset. Chatbot mode is active.\n"
+            f"Provider: {session.provider}\n"
             f"Current model: {MODEL_LABELS.get(session.model, session.model)}"
         ),
+    )
+
+
+async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = _chat_id(update)
+    if chat_id is None:
+        return
+
+    services = _services(context)
+    session = services.sessions.get(chat_id)
+
+    if not session.is_authenticated:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "Use /start first to initialize.",
+        )
+        return
+
+    args = context.args or []
+    chosen = args[0].lower() if args else ""
+
+    if chosen == "copilot":
+        session.provider = "copilot"
+        session.model = COPILOT_DEFAULT_MODEL
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "Provider set to Copilot.\nModel reset to " + COPILOT_DEFAULT_MODEL,
+        )
+        return
+    elif chosen == "opencode":
+        if not services.model_client.is_provider_available("opencode"):
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                "OpenCode is not configured. Set OPENCODE_API_KEY in your .env file.",
+            )
+            return
+        session.provider = "opencode"
+        session.model = OPENCODE_DEFAULT_MODEL
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "Provider set to OpenCode.\nModel reset to " + OPENCODE_DEFAULT_MODEL,
+        )
+        return
+    elif chosen:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "Unknown provider. Choose copilot or opencode.",
+        )
+        return
+
+    # Show provider selection
+    keyboard = []
+    if services.model_client.is_provider_available("copilot"):
+        keyboard.append([InlineKeyboardButton("Copilot", callback_data="provider:copilot")])
+    if services.model_client.is_provider_available("opencode"):
+        keyboard.append([InlineKeyboardButton("OpenCode", callback_data="provider:opencode")])
+
+    if not keyboard:
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "No providers available. Check your configuration.",
+        )
+        return
+
+    await _safe_send_message(
+        context.application,
+        chat_id,
+        f"Current provider: {session.provider}\nChoose a provider:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def provider_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.message:
+        return
+
+    await query.answer()
+    chat_id = query.message.chat_id
+    services = _services(context)
+    session = services.sessions.get(chat_id)
+
+    provider = (query.data or "").split(":", maxsplit=1)[-1]
+    if provider not in ("copilot", "opencode"):
+        return
+
+    if provider == "opencode" and not services.model_client.is_provider_available("opencode"):
+        await _safe_send_message(
+            context.application,
+            chat_id,
+            "OpenCode is not configured. Set OPENCODE_API_KEY in your .env file.",
+        )
+        return
+
+    session.provider = provider  # type: ignore[assignment]
+    if provider == "copilot":
+        session.model = COPILOT_DEFAULT_MODEL
+    else:
+        session.model = OPENCODE_DEFAULT_MODEL
+
+    provider_name = "OpenCode" if provider == "opencode" else "Copilot"
+    await _safe_send_message(
+        context.application,
+        chat_id,
+        f"Provider set to {provider_name}.\nModel reset to {session.model}",
     )
 
 
@@ -293,12 +507,27 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _safe_send_message(
             context.application,
             chat_id,
-            "Use /start first to initialize Copilot SDK.",
+            "Use /start first to initialize.",
         )
         return
 
-    chosen = _resolve_model_choice(" ".join(context.args or []))
+    chosen = _resolve_model_choice(" ".join(context.args or ""), session.provider)
     if chosen:
+        # Validate that the model is compatible with the current provider
+        if session.provider == "copilot" and chosen not in COPILOT_MODEL_IDS:
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                f"Model '{chosen}' is not available with Copilot. Use /provider to switch providers.",
+            )
+            return
+        if session.provider == "opencode" and chosen not in OPENCODE_MODEL_IDS:
+            await _safe_send_message(
+                context.application,
+                chat_id,
+                f"Model '{chosen}' is not available with OpenCode. Use /provider to switch providers.",
+            )
+            return
         session.model = chosen
         await _safe_send_message(
             context.application,
@@ -318,10 +547,11 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         context.application,
         chat_id,
         (
+            f"Provider: {session.provider}\n"
             f"Current model: {MODEL_LABELS.get(session.model, session.model)}\n"
             "Choose a model:"
         ),
-        reply_markup=_model_keyboard(),
+        reply_markup=_model_keyboard(session.provider),
     )
 
 
@@ -913,7 +1143,7 @@ async def _attempt_dependency_fix(
     )
 
     try:
-        response = await services.copilot_client.call(
+        response = await services.model_client.call(
             messages=[{"role": "user", "content": prompt}],
             model=session.model,
             system_prompt=(
@@ -1290,7 +1520,7 @@ async def _attempt_project_validation_fix(
     )
 
     try:
-        response = await services.copilot_client.call(
+        response = await services.model_client.call(
             messages=[{"role": "user", "content": prompt}],
             model=session.model,
             system_prompt="You are a senior engineer fixing validation failures. Return strict JSON only.",
@@ -1373,7 +1603,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _safe_send_message(
             context.application,
             chat_id,
-            "Copilot SDK is not connected. Run /start after `copilot auth login` in terminal.",
+            "Model client not connected. Run /start first.",
         )
         return
     if session.is_building:
@@ -1387,14 +1617,19 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     projects_root = _projects_root(context.application)
     active_project = session.active_project_path or "none"
     project_count = len(_list_generated_projects(projects_root, limit=200))
-    copilot_account = await services.copilot_client.get_authenticated_login()
+    
+    # Get provider status
+    provider_status = session.provider
+    opencode_available = "✓" if services.model_client.has_opencode else "✗"
+    
     await _safe_send_message(
         context.application,
         chat_id,
         (
             "Chatbot mode is active.\n"
             f"Authenticated: {'yes' if session.is_authenticated else 'no'}\n"
-            f"Copilot GitHub account: {copilot_account}\n"
+            f"Provider: {provider_status}\n"
+            f"OpenCode available: {opencode_available}\n"
             f"Current model: {MODEL_LABELS.get(session.model, session.model)}\n"
             f"Generated projects: {project_count}\n"
             f"Active project: {active_project}"
@@ -1540,7 +1775,7 @@ async def _handle_workspace_chat(
 
     try:
         while current_iteration < max_tool_iterations:
-            response = await services.copilot_client.call(
+            response = await services.model_client.call(
                 messages=conversation_messages,
                 model=selected_model,
                 system_prompt=(
@@ -1595,9 +1830,13 @@ async def _handle_workspace_chat(
         if not final_response:
             final_response = response
 
-    except CopilotAPIError as exc:
-        LOGGER.warning("Workspace chatbot Copilot API failure for chat_id=%s: %s", chat_id, exc)
-        await _safe_send_message(application, chat_id, f"Copilot request failed: {exc}")
+    except ModelAPIError as exc:
+        LOGGER.warning("Workspace chatbot API failure for chat_id=%s: %s", chat_id, exc)
+        await _safe_send_message(application, chat_id, f"API request failed: {exc}")
+        return
+    except ModelAuthError as exc:
+        LOGGER.warning("Workspace chatbot auth failure for chat_id=%s: %s", chat_id, exc)
+        await _safe_send_message(application, chat_id, f"Authentication failed: {exc}")
         return
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Workspace chatbot request failed for chat_id=%s", chat_id)
@@ -1606,7 +1845,7 @@ async def _handle_workspace_chat(
 
     final_response = final_response.strip()
     if not final_response:
-        await _safe_send_message(application, chat_id, "Copilot returned an empty response.")
+        await _safe_send_message(application, chat_id, "API returned an empty response.")
         return
 
     _append_project_chat_history(session, user_text, final_response)
@@ -2314,8 +2553,11 @@ def _chat_id(update: Update) -> int | None:
     return None
 
 
-def _model_keyboard(model_options: list[tuple[str, str]] | None = None) -> InlineKeyboardMarkup:
-    options = model_options or MODEL_OPTIONS
+def _model_keyboard(provider: str = "copilot") -> InlineKeyboardMarkup:
+    if provider == "opencode":
+        options = OPENCODE_MODEL_OPTIONS
+    else:
+        options = COPILOT_MODEL_OPTIONS
     keyboard = [
         [InlineKeyboardButton(label, callback_data=f"model:{value}")]
         for label, value in options
@@ -2323,19 +2565,27 @@ def _model_keyboard(model_options: list[tuple[str, str]] | None = None) -> Inlin
     return InlineKeyboardMarkup(keyboard)
 
 
-def _resolve_model_choice(raw_choice: str) -> str | None:
+def _resolve_model_choice(raw_choice: str, provider: str = "copilot") -> str | None:
     raw = raw_choice.strip()
     if not raw:
         return None
 
     normalized = raw.lower().strip()
     normalized = re.sub(r"\s+", "-", normalized)
-    if normalized in ALLOWED_MODEL_IDS:
-        return normalized
-
-    for label, value in MODEL_OPTIONS:
-        if normalized == re.sub(r"\s+", "-", label.lower().strip()):
-            return value
+    
+    # Check in provider-specific models
+    if provider == "opencode":
+        if normalized in OPENCODE_MODEL_IDS:
+            return normalized
+        for label, value in OPENCODE_MODEL_OPTIONS:
+            if normalized == re.sub(r"\s+", "-", label.lower().strip()):
+                return value
+    else:
+        if normalized in COPILOT_MODEL_IDS:
+            return normalized
+        for label, value in COPILOT_MODEL_OPTIONS:
+            if normalized == re.sub(r"\s+", "-", label.lower().strip()):
+                return value
 
     return None
 

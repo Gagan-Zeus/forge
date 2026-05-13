@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
-from models.copilot_client import CopilotClient
+from models.unified_client import UnifiedModelClient
 
 LOGGER = logging.getLogger(__name__)
 
@@ -86,8 +86,8 @@ class ProjectPlanner:
         "next.config.mjs",
     }
 
-    def __init__(self, copilot_client: CopilotClient) -> None:
-        self._copilot_client = copilot_client
+    def __init__(self, model_client: UnifiedModelClient) -> None:
+        self._model_client = model_client
 
     async def plan_project(self, idea: str, stack: str, requirements: str, model: str) -> ProjectPlan:
         prompt = (
@@ -115,7 +115,7 @@ class ProjectPlanner:
             f"Stack: {stack}\n"
             f"Special requirements: {requirements or 'none'}\n"
         )
-        response = await self._copilot_client.call(
+        response = await self._model_client.call(
             messages=[{"role": "user", "content": prompt}],
             model=model,
             system_prompt="You are a senior software architect. Return valid JSON only.",
@@ -160,7 +160,7 @@ class ProjectPlanner:
             f"Project Context:\n{project_context}\n\n"
             f"Current File Tree:\n{file_tree}\n"
         )
-        response = await self._copilot_client.call(
+        response = await self._model_client.call(
             messages=[{"role": "user", "content": prompt}],
             model=model,
             system_prompt="You are a senior software architect planning a code update. Return valid JSON only.",

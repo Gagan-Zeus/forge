@@ -4,3 +4,4 @@ PyGitHub==2.4.0
 python-dotenv==1.0.1
 aiofiles==24.1.0
 github-copilot-sdk==0.2.2
+openai>=1.0.0

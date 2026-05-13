@@ -38,6 +38,8 @@ Forge is a Telegram-triggered autonomous coding agent that turns a project idea 
     - `GITHUB_TOKEN` (recommended for GitHub push; PAT with repo permissions)
     - `PROJECTS_DIR` (Change to your Preffered Directory. default: `./generated_projects`)
     - `SYSTEM_PROMPT_PATH` (optional, default: `./system-prompt.txt`; loaded as hidden base system prompt)
+    - `OPENCODE_API_KEY` (optional - for OpenCode Zen provider)
+    - `DEFAULT_MODEL_PROVIDER` (optional - default: `copilot`, can be `copilot` or `opencode`)
 
 ## How To Run
 
@@ -77,7 +79,7 @@ Then run the bot and send `/start`. The bot checks CLI auth state through the SD
 
 ## Copilot Models
 
-Only these models are available through `/model`, with default `gpt-5-mini`:
+Only these models are available through `/model` when using Copilot provider, with default `gpt-5-mini`:
 
 - `gpt-5.3-codex`
 - `gpt-5.2-codex`
@@ -86,6 +88,42 @@ Only these models are available through `/model`, with default `gpt-5-mini`:
 - `gpt-5-mini`
 - `gpt-4.1`
 - `claude-haiku-4.5`
+
+## OpenCode Models (Beta)
+
+You can now use models from OpenCode Zen API! To enable:
+
+1. Get your API key at https://opencode.ai/auth
+2. Set `OPENCODE_API_KEY` in your `.env` file
+3. Use `/provider` command to switch to OpenCode
+
+Available OpenCode models include:
+
+**GPT Models:**
+- `gpt-5.5`, `gpt-5.5-pro`
+- `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano`
+- `gpt-5.3-codex`, `gpt-5.3-codex-spark`
+- `gpt-5.2`, `gpt-5.2-codex`
+- `gpt-5.1`, `gpt-5.1-codex`, `gpt-5.1-codex-max`, `gpt-5.1-codex-mini`
+- `gpt-5`, `gpt-5-codex`, `gpt-5-nano`
+
+**Claude Models:**
+- `claude-opus-4-7`, `claude-opus-4-6`, `claude-opus-4-5`, `claude-opus-4-1`
+- `claude-sonnet-4-6`, `claude-sonnet-4-5`, `claude-sonnet-4`
+- `claude-haiku-4-5`, `claude-3-5-haiku`
+
+**Gemini Models:**
+- `gemini-3.1-pro`, `gemini-3-flash`
+
+**Free Models:**
+- `deepseek-v4-flash-free`, `minimax-m2.5-free`, `big-pickle`, and more
+
+## Provider Command
+
+Use `/provider` to switch between Copilot and OpenCode:
+- `/provider copilot` - Use GitHub Copilot (requires Copilot CLI auth)
+- `/provider opencode` - Use OpenCode Zen API (requires API key)
+- `/provider` (without args) - Shows available providers
 
 ## Project Build Command
 

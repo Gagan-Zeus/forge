@@ -11,7 +11,7 @@ from typing import Awaitable, Callable
 
 from agent.planner import ProjectPlan, ProjectPlanner
 from bot.session import UserSession
-from models.copilot_client import CopilotClient
+from models.unified_client import UnifiedModelClient
 from tools.dependency_version_resolver import DependencyVersionResolver
 from tools.file_writer import FileWriter
 from tools.github_pusher import GitHubPusher
@@ -44,14 +44,14 @@ class BuildOrchestrator:
 
     def __init__(
         self,
-        copilot_client: CopilotClient,
+        model_client: UnifiedModelClient,
         planner: ProjectPlanner,
         file_writer: FileWriter,
         shell_runner: ShellRunner,
         github_pusher: GitHubPusher | None = None,
         dependency_version_resolver: DependencyVersionResolver | None = None,
     ) -> None:
-        self._copilot_client = copilot_client
+        self._model_client = model_client
         self._planner = planner
         self._file_writer = file_writer
         self._shell_runner = shell_runner
@@ -413,7 +413,7 @@ class BuildOrchestrator:
 
         prompt += f"Previously written/relevant files for context:\n{related_context}\n"
 
-        response = await self._copilot_client.call(
+        response = await self._model_client.call(
             messages=[{"role": "user", "content": prompt}],
             model=session.model,
             system_prompt="You are a senior software engineer updating production code. Return only the code.",
@@ -532,7 +532,7 @@ class BuildOrchestrator:
                 "- Commands must exactly match this project's actual scripts/files.\n"
                 "- Avoid curl, wget, sudo, eval, or destructive commands in any command examples.\n"
             )
-        response = await self._copilot_client.call(
+        response = await self._model_client.call(
             messages=[{"role": "user", "content": prompt}],
             model=session.model,
             system_prompt="You are a senior software engineer producing production-ready files.",
@@ -579,7 +579,7 @@ class BuildOrchestrator:
             "- Include Example usage and Limitations.\n"
             "- Keep instructions actionable and concise.\n"
         )
-        response = await self._copilot_client.call(
+        response = await self._model_client.call(
             messages=[{"role": "user", "content": prompt}],
             model=session.model,
             system_prompt="You write practical, accurate project documentation.",
@@ -778,7 +778,7 @@ class BuildOrchestrator:
             f"Requirements: {session.requirements or 'none'}\n"
         )
         try:
-            response = await self._copilot_client.call(
+            response = await self._model_client.call(
                 messages=[{"role": "user", "content": prompt}],
                 model=session.model,
                 system_prompt="You generate precise software project names.",

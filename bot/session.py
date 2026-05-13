@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Literal
 
 
 @dataclass
@@ -10,6 +10,7 @@ class UserSession:
     idea: str = ""
     stack: str = ""
     model: str = "gpt-5-mini"
+    provider: Literal["copilot", "opencode"] = "copilot"
     requirements: str = ""
     push_to_github: bool = False
     repo_name: str = ""
@@ -39,7 +40,8 @@ class SessionStore:
     def reset(self, chat_id: int, keep_auth: bool = True) -> UserSession:
         previous = self._sessions.get(chat_id)
         is_authenticated = previous.is_authenticated if previous and keep_auth else False
-        session = UserSession(is_authenticated=is_authenticated)
+        provider = previous.provider if previous and keep_auth else "copilot"
+        session = UserSession(is_authenticated=is_authenticated, provider=provider)
         self._sessions[chat_id] = session
         return session
 
@@ -54,6 +56,7 @@ def build_summary(session: UserSession) -> str:
         f"- Idea: {session.idea}",
         f"- Stack: {session.stack}",
         f"- Model: {session.model}",
+        f"- Provider: {session.provider}",
         f"- Requirements: {requirements}",
         f"- Push to GitHub: {'yes' if session.push_to_github else 'no'}",
     ]
