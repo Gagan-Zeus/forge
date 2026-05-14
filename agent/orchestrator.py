@@ -72,6 +72,7 @@ class BuildOrchestrator:
     ) -> BuildResult:
         cancel_event = asyncio.Event()
         self._cancel_events[chat_id] = cancel_event
+        conversation_key = session.copilot_conversation_key or None
 
         project_name = await self._derive_project_name(session)
         project_dir = self._file_writer.create_project_dir(project_name)
@@ -87,6 +88,7 @@ class BuildOrchestrator:
                 stack=session.stack,
                 requirements=session.requirements,
                 model=session.model,
+                conversation_key=conversation_key,
             )
             await self._raise_if_cancelled(cancel_event)
             await self._report_status(
@@ -224,6 +226,7 @@ class BuildOrchestrator:
     ) -> BuildResult:
         cancel_event = asyncio.Event()
         self._cancel_events[chat_id] = cancel_event
+        conversation_key = session.copilot_conversation_key or None
 
         if not session.active_project_path:
             return BuildResult(
@@ -258,6 +261,7 @@ class BuildOrchestrator:
                 project_context=project_context,
                 file_tree=file_tree,
                 model=session.model,
+                conversation_key=conversation_key,
             )
             await self._raise_if_cancelled(cancel_event)
             await self._report_status(progress_callback, "PLAN", f"Update plan: {update_plan.reasoning}")
@@ -417,6 +421,7 @@ class BuildOrchestrator:
             messages=[{"role": "user", "content": prompt}],
             model=session.model,
             system_prompt="You are a senior software engineer updating production code. Return only the code.",
+            conversation_key=session.copilot_conversation_key or None,
         )
         return self._strip_markdown_fences(response)
 
@@ -536,6 +541,7 @@ class BuildOrchestrator:
             messages=[{"role": "user", "content": prompt}],
             model=session.model,
             system_prompt="You are a senior software engineer producing production-ready files.",
+            conversation_key=session.copilot_conversation_key or None,
         )
         return self._strip_markdown_fences(response)
 
@@ -583,6 +589,7 @@ class BuildOrchestrator:
             messages=[{"role": "user", "content": prompt}],
             model=session.model,
             system_prompt="You write practical, accurate project documentation.",
+            conversation_key=session.copilot_conversation_key or None,
         )
         return self._strip_markdown_fences(response)
 
@@ -782,6 +789,7 @@ class BuildOrchestrator:
                 messages=[{"role": "user", "content": prompt}],
                 model=session.model,
                 system_prompt="You generate precise software project names.",
+                conversation_key=session.copilot_conversation_key or None,
             )
             first_line = response.strip().splitlines()[0] if response.strip() else ""
             suggested_name = self._sanitize_project_name(first_line)

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
@@ -215,12 +216,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     services = _services(context)
+    previous = services.sessions.get(chat_id)
+    await _reset_copilot_conversation(services, previous)
     session = services.sessions.reset(chat_id, keep_auth=False)
 
     try:
         await services.copilot_client.ensure_ready()
         session.is_authenticated = True
         session.model = DEFAULT_MODEL
+        session.copilot_conversation_key = _new_copilot_conversation_key(chat_id)
         await _safe_send_message(
             context.application,
             chat_id,
@@ -267,10 +271,13 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     services = _services(context)
     previous = services.sessions.get(chat_id)
+    await _reset_copilot_conversation(services, previous)
     preserved_model = previous.model if previous.model in ALLOWED_MODEL_IDS else DEFAULT_MODEL
     session = services.sessions.reset(chat_id, keep_auth=True)
     session.model = preserved_model
     session.is_authenticated = previous.is_authenticated
+    if session.is_authenticated:
+        session.copilot_conversation_key = _new_copilot_conversation_key(chat_id)
     await _safe_send_message(
         context.application,
         chat_id,
@@ -358,6 +365,7 @@ async def create_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    _ensure_copilot_conversation_key(session, chat_id)
     await _handle_project_build_request(
         context.application,
         services,
@@ -418,6 +426,7 @@ async def project_selection_callback(update: Update, context: ContextTypes.DEFAU
         return
 
     session.active_project_path = str(project_path)
+    _ensure_copilot_conversation_key(session, chat_id)
     # Re-build project context for chatbot and updates
     session.project_context = f"Project name: {project_name}\nLocal path: {session.active_project_path}"
     
@@ -517,6 +526,7 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     session.is_building = True
     session.build_progress = "Initializing update..."
+    _ensure_copilot_conversation_key(session, chat_id)
 
     async def _progress_update(message: str) -> None:
         session.build_progress = message
@@ -574,6 +584,8 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _safe_send_message(context.application, chat_id, f"Project path '{project_path}' does not exist.")
         session.active_project_path = ""
         session.active_github_url = ""
+        session.project_context = ""
+        await _reset_copilot_conversation(services, session)
         return
 
     # Delete the project directory
@@ -590,6 +602,7 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         session.active_github_url = ""
         session.repo_name = ""
         session.project_context = ""
+        await _reset_copilot_conversation(services, session)
     except Exception as exc:
         LOGGER.exception("Failed to delete project for chat_id=%s", chat_id)
         await _safe_send_message(context.application, chat_id, f"Failed to delete project: {exc}")
@@ -920,6 +933,7 @@ async def _attempt_dependency_fix(
                 "You are a dependency resolution expert. Analyze installation errors and provide "
                 "concrete fixes. Return valid JSON with specific actions to take."
             ),
+            conversation_key=session.copilot_conversation_key or None,
         )
 
         # Try to parse the JSON response
@@ -1294,6 +1308,7 @@ async def _attempt_project_validation_fix(
             messages=[{"role": "user", "content": prompt}],
             model=session.model,
             system_prompt="You are a senior engineer fixing validation failures. Return strict JSON only.",
+            conversation_key=session.copilot_conversation_key or None,
         )
         payload = _extract_json_object(response)
     except Exception as exc:  # noqa: BLE001
@@ -1455,6 +1470,7 @@ async def workspace_message_handler(update: Update, context: ContextTypes.DEFAUL
             )
             return
 
+        _ensure_copilot_conversation_key(session, chat_id)
         await _handle_workspace_chat(
             context.application,
             services,
@@ -1536,6 +1552,7 @@ async def _handle_workspace_chat(
     max_tool_iterations = 5
     current_iteration = 0
     conversation_messages = [*history_window, {"role": "user", "content": prompt}]
+    conversation_key = _ensure_copilot_conversation_key(session, chat_id)
     final_response = ""
 
     try:
@@ -1553,6 +1570,7 @@ async def _handle_workspace_chat(
                     "After receiving tool results, analyze them and provide a helpful response to the user."
                 ),
                 attachments=attachments if current_iteration == 0 else None,
+                conversation_key=conversation_key,
             )
 
             response = response.strip()
@@ -1620,6 +1638,7 @@ async def _handle_project_build_request(
     session: UserSession,
     user_text: str,
 ) -> None:
+    _ensure_copilot_conversation_key(session, chat_id)
     session.idea = user_text.strip()
     session.stack = _infer_stack_from_text(user_text)
     session.requirements = user_text.strip()
@@ -2312,6 +2331,26 @@ def _chat_id(update: Update) -> int | None:
     if update.effective_chat:
         return update.effective_chat.id
     return None
+
+
+def _new_copilot_conversation_key(chat_id: int) -> str:
+    return f"forge-{chat_id}-{uuid.uuid4().hex}"
+
+
+def _ensure_copilot_conversation_key(session: UserSession, chat_id: int) -> str:
+    key = session.copilot_conversation_key.strip()
+    if key:
+        return key
+    session.copilot_conversation_key = _new_copilot_conversation_key(chat_id)
+    return session.copilot_conversation_key
+
+
+async def _reset_copilot_conversation(services: RuntimeServices, session: UserSession) -> None:
+    key = session.copilot_conversation_key.strip()
+    if not key:
+        return
+    await services.copilot_client.reset_conversation(key)
+    session.copilot_conversation_key = ""
 
 
 def _model_keyboard(model_options: list[tuple[str, str]] | None = None) -> InlineKeyboardMarkup:

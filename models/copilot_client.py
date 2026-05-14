@@ -5,6 +5,7 @@ import logging
 import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,13 @@ class CopilotAuthError(RuntimeError):
 
 class CopilotAPIError(RuntimeError):
     """Raised when Copilot model calls fail."""
+
+
+@dataclass
+class _PersistentConversationState:
+    session: Any
+    model: str
+    lock: asyncio.Lock
 
 
 class CopilotClient:
@@ -53,6 +61,8 @@ class CopilotClient:
 
         self._sdk_client: SDKCopilotClient | None = None
         self._client_lock = asyncio.Lock()
+        self._persistent_sessions_lock = asyncio.Lock()
+        self._persistent_sessions: dict[str, _PersistentConversationState] = {}
         self._model_refresh_warning_emitted = False
 
     @staticmethod
@@ -181,155 +191,259 @@ class CopilotClient:
         system_prompt: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
         on_assistant_delta: Callable[[str], Awaitable[None] | None] | None = None,
+        conversation_key: str | None = None,
     ) -> str:
         await self.ensure_ready()
         prompt = self._messages_to_prompt(messages)
+        merged_system_prompt = self._merged_system_prompt(system_prompt)
         max_attempts = 1 if on_assistant_delta else self.CHAT_MAX_ATTEMPTS
+        persistent_state: _PersistentConversationState | None = None
+        should_reset_persistent_session = False
 
-        for attempt in range(1, max_attempts + 1):
-            session = None
-            unsubscribe = None
-            streamed_chunks: list[str] = []
-            pending_stream_tasks: set[asyncio.Task[None]] = set()
-            loop = asyncio.get_running_loop()
+        if conversation_key:
+            prompt = self._inline_system_prompt(prompt=prompt, system_prompt=merged_system_prompt)
+            merged_system_prompt = None
+            persistent_state = await self._get_or_create_persistent_session(conversation_key, model)
 
-            def _consume_stream_task(task: asyncio.Task[None]) -> None:
-                pending_stream_tasks.discard(task)
+        async def _invoke_with_session_lock() -> str:
+            nonlocal should_reset_persistent_session
+            for attempt in range(1, max_attempts + 1):
+                session = None
+                unsubscribe = None
+                streamed_chunks: list[str] = []
+                pending_stream_tasks: set[asyncio.Task[None]] = set()
+                loop = asyncio.get_running_loop()
+
+                def _consume_stream_task(task: asyncio.Task[None]) -> None:
+                    pending_stream_tasks.discard(task)
+                    try:
+                        task.result()
+                    except Exception:  # noqa: BLE001
+                        LOGGER.debug("Ignoring assistant delta callback failure", exc_info=True)
+
+                def _publish_stream_delta(delta_text: str) -> None:
+                    if not on_assistant_delta or not delta_text:
+                        return
+                    try:
+                        maybe_awaitable = on_assistant_delta(delta_text)
+                    except Exception:  # noqa: BLE001
+                        LOGGER.debug("Ignoring assistant delta callback failure", exc_info=True)
+                        return
+                    if asyncio.iscoroutine(maybe_awaitable):
+                        task = loop.create_task(maybe_awaitable)
+                        pending_stream_tasks.add(task)
+                        task.add_done_callback(_consume_stream_task)
+
+                def _on_session_event(event: Any) -> None:
+                    delta_text = self._extract_assistant_delta_text(event)
+                    if not delta_text:
+                        return
+                    streamed_chunks.append(delta_text)
+                    _publish_stream_delta(delta_text)
+
                 try:
-                    task.result()
-                except Exception:  # noqa: BLE001
-                    LOGGER.debug("Ignoring assistant delta callback failure", exc_info=True)
+                    if persistent_state is not None:
+                        session = persistent_state.session
+                    else:
+                        session = await self._create_session(
+                            model=model,
+                            streaming=on_assistant_delta is not None,
+                            merged_system_prompt=merged_system_prompt,
+                        )
 
-            def _publish_stream_delta(delta_text: str) -> None:
-                if not on_assistant_delta or not delta_text:
-                    return
-                try:
-                    maybe_awaitable = on_assistant_delta(delta_text)
-                except Exception:  # noqa: BLE001
-                    LOGGER.debug("Ignoring assistant delta callback failure", exc_info=True)
-                    return
-                if asyncio.iscoroutine(maybe_awaitable):
-                    task = loop.create_task(maybe_awaitable)
-                    pending_stream_tasks.add(task)
-                    task.add_done_callback(_consume_stream_task)
+                    if on_assistant_delta is not None:
+                        unsubscribe = session.on(_on_session_event)
+                    attempt_timeout = self._attempt_timeout_seconds(attempt)
+                    event = await self._send_and_wait(
+                        session=session,
+                        prompt=prompt,
+                        timeout_seconds=attempt_timeout,
+                        attachments=attachments,
+                    )
+                    text = self._extract_assistant_text(event)
 
-            def _on_session_event(event: Any) -> None:
-                delta_text = self._extract_assistant_delta_text(event)
-                if not delta_text:
-                    return
-                streamed_chunks.append(delta_text)
-                _publish_stream_delta(delta_text)
+                    if not text:
+                        events = await session.get_messages()
+                        text = self._extract_assistant_text_from_events(events)
 
-            try:
-                sdk_client = await self._ensure_sdk_client()
-                session_kwargs: dict[str, Any] = {
-                    "on_permission_request": PermissionHandler.approve_all,
-                    "model": model,
-                    "streaming": on_assistant_delta is not None,
-                }
-                merged_system_prompt = self._merged_system_prompt(system_prompt)
-                if merged_system_prompt:
-                    session_kwargs["system_message"] = {
-                        "mode": "append",
-                        "content": merged_system_prompt,
-                    }
+                    if not text and streamed_chunks:
+                        text = "".join(streamed_chunks).strip()
 
-                session = await sdk_client.create_session(**session_kwargs)
-                if on_assistant_delta is not None:
-                    unsubscribe = session.on(_on_session_event)
-                attempt_timeout = self._attempt_timeout_seconds(attempt)
-                event = await self._send_and_wait(
-                    session=session,
-                    prompt=prompt,
-                    timeout_seconds=attempt_timeout,
-                    attachments=attachments,
-                )
-                text = self._extract_assistant_text(event)
+                    if pending_stream_tasks:
+                        await asyncio.gather(*pending_stream_tasks, return_exceptions=True)
 
-                if not text:
-                    events = await session.get_messages()
-                    text = self._extract_assistant_text_from_events(events)
+                    if text:
+                        return text
 
-                if not text and streamed_chunks:
-                    text = "".join(streamed_chunks).strip()
+                    if attempt < max_attempts:
+                        retry_delay = self._retry_delay_seconds(attempt)
+                        LOGGER.warning(
+                            "Copilot SDK returned an empty response on attempt %s/%s. Retrying in %.1fs.",
+                            attempt,
+                            max_attempts,
+                            retry_delay,
+                        )
+                        await asyncio.sleep(retry_delay)
+                        continue
 
-                if pending_stream_tasks:
-                    await asyncio.gather(*pending_stream_tasks, return_exceptions=True)
+                    raise CopilotAPIError("Copilot SDK returned an empty response.")
+                except CopilotAuthError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    if self._looks_like_auth_error(exc):
+                        raise CopilotAuthError(
+                            "GitHub Copilot CLI is not authenticated. "
+                            "Run `copilot auth login` and retry. "
+                            f"Details: {exc}"
+                        ) from exc
 
-                if text:
-                    return text
+                    is_timeout = self._looks_like_timeout_error(exc)
+                    if is_timeout:
+                        configured_timeout = (
+                            f"{self._timeout_seconds:.1f}s" if self._timeout_seconds is not None else "disabled"
+                        )
+                        LOGGER.warning(
+                            "Copilot SDK timed out on attempt %s/%s (base timeout %s).",
+                            attempt,
+                            max_attempts,
+                            configured_timeout,
+                        )
 
-                if attempt < max_attempts:
+                    if attempt >= max_attempts:
+                        partial_text = "".join(streamed_chunks).strip()
+                        if partial_text:
+                            if pending_stream_tasks:
+                                await asyncio.gather(*pending_stream_tasks, return_exceptions=True)
+                            return partial_text
+                        if is_timeout:
+                            if persistent_state is None:
+                                await self._reset_sdk_client()
+                            else:
+                                should_reset_persistent_session = True
+                        raise CopilotAPIError(
+                            "Could not complete Copilot SDK request after multiple attempts. "
+                            f"Last error: {exc}"
+                        ) from exc
+
+                    if is_timeout:
+                        if persistent_state is None:
+                            await self._reset_sdk_client()
+                        else:
+                            should_reset_persistent_session = True
                     retry_delay = self._retry_delay_seconds(attempt)
                     LOGGER.warning(
-                        "Copilot SDK returned an empty response on attempt %s/%s. Retrying in %.1fs.",
+                        "Copilot SDK network/session error on attempt %s/%s: %s. Retrying in %.1fs.",
                         attempt,
                         max_attempts,
+                        exc,
                         retry_delay,
                     )
                     await asyncio.sleep(retry_delay)
-                    continue
+                finally:
+                    if unsubscribe is not None:
+                        unsubscribe()
+                    if session is not None and persistent_state is None:
+                        await self._destroy_session(session)
 
-                raise CopilotAPIError("Copilot SDK returned an empty response.")
-            except CopilotAuthError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                if self._looks_like_auth_error(exc):
-                    raise CopilotAuthError(
-                        "GitHub Copilot CLI is not authenticated. "
-                        "Run `copilot auth login` and retry. "
-                        f"Details: {exc}"
-                    ) from exc
+            raise CopilotAPIError("Copilot SDK call failed after retries.")
 
-                is_timeout = self._looks_like_timeout_error(exc)
-                if is_timeout:
-                    configured_timeout = (
-                        f"{self._timeout_seconds:.1f}s" if self._timeout_seconds is not None else "disabled"
-                    )
-                    LOGGER.warning(
-                        "Copilot SDK timed out on attempt %s/%s (base timeout %s).",
-                        attempt,
-                        max_attempts,
-                        configured_timeout,
-                    )
+        if persistent_state is None:
+            return await _invoke_with_session_lock()
 
-                if attempt >= max_attempts:
-                    partial_text = "".join(streamed_chunks).strip()
-                    if partial_text:
-                        if pending_stream_tasks:
-                            await asyncio.gather(*pending_stream_tasks, return_exceptions=True)
-                        return partial_text
-                    if is_timeout:
-                        await self._reset_sdk_client()
-                    raise CopilotAPIError(
-                        "Could not complete Copilot SDK request after multiple attempts. "
-                        f"Last error: {exc}"
-                    ) from exc
+        try:
+            async with persistent_state.lock:
+                return await _invoke_with_session_lock()
+        finally:
+            if should_reset_persistent_session and conversation_key:
+                await self.reset_conversation(conversation_key)
 
-                if is_timeout:
-                    await self._reset_sdk_client()
-                retry_delay = self._retry_delay_seconds(attempt)
-                LOGGER.warning(
-                    "Copilot SDK network/session error on attempt %s/%s: %s. Retrying in %.1fs.",
-                    attempt,
-                    max_attempts,
-                    exc,
-                    retry_delay,
+    async def reset_conversation(self, conversation_key: str | None) -> None:
+        key = (conversation_key or "").strip()
+        if not key:
+            return
+
+        state: _PersistentConversationState | None = None
+        async with self._persistent_sessions_lock:
+            state = self._persistent_sessions.pop(key, None)
+
+        if not state:
+            return
+
+        async with state.lock:
+            await self._destroy_session(state.session)
+
+    async def _get_or_create_persistent_session(
+        self,
+        conversation_key: str,
+        model: str,
+    ) -> _PersistentConversationState:
+        stale_state: _PersistentConversationState | None = None
+        async with self._persistent_sessions_lock:
+            state = self._persistent_sessions.get(conversation_key)
+            if state and state.model != model:
+                stale_state = self._persistent_sessions.pop(conversation_key, None)
+                state = None
+
+            if state is None:
+                session = await self._create_session(
+                    model=model,
+                    streaming=True,
+                    merged_system_prompt=None,
                 )
-                await asyncio.sleep(retry_delay)
-            finally:
-                if unsubscribe is not None:
-                    unsubscribe()
-                if session is not None:
-                    try:
-                        if hasattr(session, "disconnect"):
-                            await session.disconnect()
-                        else:
-                            await session.destroy()
-                    except Exception:  # noqa: BLE001
-                        LOGGER.debug("Ignoring Copilot SDK session destroy failure", exc_info=True)
+                state = _PersistentConversationState(
+                    session=session,
+                    model=model,
+                    lock=asyncio.Lock(),
+                )
+                self._persistent_sessions[conversation_key] = state
 
-        raise CopilotAPIError("Copilot SDK call failed after retries.")
+        if stale_state is not None:
+            async with stale_state.lock:
+                await self._destroy_session(stale_state.session)
+        return state
+
+    async def _create_session(
+        self,
+        *,
+        model: str,
+        streaming: bool,
+        merged_system_prompt: str | None,
+    ) -> Any:
+        sdk_client = await self._ensure_sdk_client()
+        session_kwargs: dict[str, Any] = {
+            "on_permission_request": PermissionHandler.approve_all,
+            "model": model,
+            "streaming": streaming,
+        }
+        if merged_system_prompt:
+            session_kwargs["system_message"] = {
+                "mode": "append",
+                "content": merged_system_prompt,
+            }
+        return await sdk_client.create_session(**session_kwargs)
+
+    async def _destroy_session(self, session: Any) -> None:
+        try:
+            if hasattr(session, "disconnect"):
+                await session.disconnect()
+            else:
+                await session.destroy()
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Ignoring Copilot SDK session destroy failure", exc_info=True)
+
+    @staticmethod
+    def _inline_system_prompt(prompt: str, system_prompt: str | None) -> str:
+        normalized_prompt = prompt.strip()
+        scoped_prompt = (system_prompt or "").strip()
+        if not scoped_prompt:
+            return normalized_prompt
+        if not normalized_prompt:
+            return f"System instructions:\n{scoped_prompt}"
+        return (
+            "Apply these system instructions while answering this request.\n"
+            f"System instructions:\n{scoped_prompt}\n\n"
+            f"{normalized_prompt}"
+        )
 
     async def _ensure_sdk_client(self) -> SDKCopilotClient:
         if self._sdk_client is not None and self._sdk_client.get_state() == "connected":
@@ -368,6 +482,14 @@ class CopilotClient:
             return self._sdk_client
 
     async def _reset_sdk_client(self) -> None:
+        async with self._persistent_sessions_lock:
+            persistent_states = list(self._persistent_sessions.values())
+            self._persistent_sessions.clear()
+
+        for state in persistent_states:
+            async with state.lock:
+                await self._destroy_session(state.session)
+
         async with self._client_lock:
             if self._sdk_client is None:
                 return

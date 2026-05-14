@@ -93,6 +93,8 @@ Project generation runs **only** through `/create`.
 
 - Example: `/create build a hello world html page`
 - Regular chat messages (even if they mention "create", "build", or similar terms) stay in normal Copilot chat mode.
+- Forge now keeps a single Copilot conversation per Telegram chat during project work, so `/create` planning + file generation share one continuous context.
+- That Copilot conversation is reset by `/reset` or when `/delete` removes the active project.
 - The builder now runs in explicit phases with Telegram status updates: **PLAN -> BUILD -> README -> FINAL**.
 - Files are generated incrementally and written to disk immediately (not as one giant final response).
 - `/create` focuses on project creation and does not run post-generation tests/validation.

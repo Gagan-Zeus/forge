@@ -25,6 +25,7 @@ class UserSession:
     chat_history: list[dict[str, str]] = field(default_factory=list)
     active_project_path: str = ""
     active_github_url: str = ""
+    copilot_conversation_key: str = ""
 
 
 class SessionStore:

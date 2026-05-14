@@ -89,7 +89,14 @@ class ProjectPlanner:
     def __init__(self, copilot_client: CopilotClient) -> None:
         self._copilot_client = copilot_client
 
-    async def plan_project(self, idea: str, stack: str, requirements: str, model: str) -> ProjectPlan:
+    async def plan_project(
+        self,
+        idea: str,
+        stack: str,
+        requirements: str,
+        model: str,
+        conversation_key: str | None = None,
+    ) -> ProjectPlan:
         prompt = (
             "Design a production-ready project plan as JSON only.\n"
             "Return exactly this schema:\n"
@@ -119,6 +126,7 @@ class ProjectPlanner:
             messages=[{"role": "user", "content": prompt}],
             model=model,
             system_prompt="You are a senior software architect. Return valid JSON only.",
+            conversation_key=conversation_key,
         )
         payload = self._extract_json(response)
         project_description = str(payload.get("project_description", "")).strip()
@@ -140,6 +148,7 @@ class ProjectPlanner:
         project_context: str,
         file_tree: str,
         model: str,
+        conversation_key: str | None = None,
     ) -> UpdatePlan:
         prompt = (
             "Plan the necessary file updates for the existing project based on the user's request.\n"
@@ -164,6 +173,7 @@ class ProjectPlanner:
             messages=[{"role": "user", "content": prompt}],
             model=model,
             system_prompt="You are a senior software architect planning a code update. Return valid JSON only.",
+            conversation_key=conversation_key,
         )
         payload = self._extract_json(response)
         reasoning = str(payload.get("reasoning", "Updating project files.")).strip()
@@ -185,8 +195,23 @@ class ProjectPlanner:
 
         return UpdatePlan(reasoning=reasoning, files_to_update=validated)
 
-    async def plan_files(self, idea: str, stack: str, requirements: str, model: str) -> list[dict[str, str]]:
-        return (await self.plan_project(idea=idea, stack=stack, requirements=requirements, model=model)).files
+    async def plan_files(
+        self,
+        idea: str,
+        stack: str,
+        requirements: str,
+        model: str,
+        conversation_key: str | None = None,
+    ) -> list[dict[str, str]]:
+        return (
+            await self.plan_project(
+                idea=idea,
+                stack=stack,
+                requirements=requirements,
+                model=model,
+                conversation_key=conversation_key,
+            )
+        ).files
 
     def _extract_and_trim_files(
         self,
